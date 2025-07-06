@@ -292,7 +292,7 @@ async def status(ctx):
 
 @bot.command()
 async def order66(ctx):
-    await ctx.send("Killing all worms in the galaxy startiing with moffers.")
+    await ctx.send("Killing all Furries  in the galaxy startiing with Doc and Cor.")
 
 @bot.command()
 async def quote(ctx):
