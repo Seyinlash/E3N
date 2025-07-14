@@ -77,12 +77,54 @@ async def on_ready():
 
 @bot.command()
 @commands.has_permissions(manage_messages=True)
-async def loghost(ctx, member: discord.Member):
+async def loghost(ctx, member: discord.Member, count: int = 1):
     data = load_data()
     uid, month = ensure_member(data, member)
-    data[uid]["monthly"][month] += 1
+    data[uid]["monthly"][month] += count
     save_data(data)
-    await ctx.send(f"📌 Logged hosted event for {data[uid]['display_name']}. This month: {data[uid]['monthly'][month]}")
+    await ctx.send(f"📌 Logged {count} hosted event(s) for {data[uid]['display_name']}. This month: {data[uid]['monthly'][month]}")
+
+@bot.command()
+@commands.has_permissions(manage_messages=True)
+async def deletehost(ctx, member: discord.Member, count: int = 1):
+    data = load_data()
+    uid, month = ensure_member(data, member)
+    current_count = data[uid]["monthly"].get(month, 0)
+    if current_count > 0:
+        removed = min(count, current_count)
+        data[uid]["monthly"][month] -= removed
+        save_data(data)
+        await ctx.send(f"🗑️ Removed {removed} hosting log(s) for {data[uid]['display_name']}. Now: {data[uid]['monthly'][month]}")
+    else:
+        await ctx.send(f"❌ No hosting logs to delete for {data[uid]['display_name']} this month.")
+
+@bot.command()
+@commands.has_permissions(manage_messages=True)
+async def strike(ctx, member: discord.Member, count: int = 1):
+    data = load_data()
+    uid, _ = ensure_member(data, member)
+    data[uid]["strikes"] += count
+    save_data(data)
+    await ctx.send(f"⚠️ Added {count} strike(s) to {data[uid]['display_name']}. Total: {data[uid]['strikes']}")
+
+@bot.command()
+async def strikes(ctx):
+    data = load_data()
+    if not data:
+        await ctx.send("📭 No strike data recorded.")
+        return
+
+    out = "\n".join(f"{d['display_name']}: {d['strikes']}" for d in data.values())
+    await ctx.send("**Strikes:**\n" + out)
+
+@bot.command()
+@commands.has_permissions(manage_messages=True)
+async def resetstrikes(ctx, member: discord.Member):
+    data = load_data()
+    uid, _ = ensure_member(data, member)
+    data[uid]["strikes"] = 0
+    save_data(data)
+    await ctx.send(f"✅ Strikes reset for {data[uid]['display_name']}.")
 
 @bot.command()
 async def logs(ctx):
@@ -109,46 +151,6 @@ async def logs(ctx):
     await ctx.send(f"🧾 **{datetime.utcnow().strftime('%B')} Logs**\n\n"
                    f"**Hosting:**\n" + "\n".join(host_lines) +
                    f"\n\n**Strikes:**\n" + "\n".join(strike_lines))
-
-@bot.command()
-@commands.has_permissions(manage_messages=True)
-async def deletehost(ctx, member: discord.Member):
-    data = load_data()
-    uid, month = ensure_member(data, member)
-    if data[uid]["monthly"].get(month, 0) > 0:
-        data[uid]["monthly"][month] -= 1
-        save_data(data)
-        await ctx.send(f"🗑️ Removed one hosting log for {data[uid]['display_name']}. Now: {data[uid]['monthly'][month]}")
-    else:
-        await ctx.send(f"❌ No hosting logs to delete for {data[uid]['display_name']} this month.")
-
-@bot.command()
-@commands.has_permissions(manage_messages=True)
-async def strike(ctx, member: discord.Member):
-    data = load_data()
-    uid, _ = ensure_member(data, member)
-    data[uid]["strikes"] += 1
-    save_data(data)
-    await ctx.send(f"⚠️ Strike added to {data[uid]['display_name']}. Total: {data[uid]['strikes']}")
-
-@bot.command()
-async def strikes(ctx):
-    data = load_data()
-    if not data:
-        await ctx.send("📭 No strike data recorded.")
-        return
-
-    out = "\n".join(f"{d['display_name']}: {d['strikes']}" for d in data.values())
-    await ctx.send("**Strikes:**\n" + out)
-
-@bot.command()
-@commands.has_permissions(manage_messages=True)
-async def resetstrikes(ctx, member: discord.Member):
-    data = load_data()
-    uid, _ = ensure_member(data, member)
-    data[uid]["strikes"] = 0
-    save_data(data)
-    await ctx.send(f"✅ Strikes reset for {data[uid]['display_name']}.")
 
 # === Run Bot ===
 bot.run(TOKEN)
