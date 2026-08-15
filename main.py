@@ -4,6 +4,8 @@ import discord
 from discord.ext import commands
 import os
 import json
+import psycopg2
+from psycopg2.extras import RealDictCursor, Json
 from datetime import datetime
 from dotenv import load_dotenv
 import random
@@ -24,9 +26,10 @@ def keep_alive():
 
 keep_alive()
 
-# === Load Token ===
+# === Load Token & DB URL ===
 load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
+DATABASE_URL = os.getenv("DATABASE_URL")
 
 # === Bot Setup ===
 intents = discord.Intents.default()
@@ -34,18 +37,84 @@ intents.message_content = True
 intents.members = True
 bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
 
-DATA_FILE = "log_data.json"
+# === Database Setup ===
+def get_db():
+    return psycopg2.connect(DATABASE_URL, sslmode="require")
 
+def init_db():
+    try:
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS members (
+                user_id TEXT PRIMARY KEY,
+                display_name TEXT,
+                strikes INT DEFAULT 0,
+                monthly JSONB DEFAULT '{}'::jsonb
+            )
+        """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS counting_config (
+                id INT PRIMARY KEY DEFAULT 1,
+                channel_id BIGINT,
+                enabled BOOLEAN DEFAULT TRUE,
+                current_count INT DEFAULT 0,
+                last_user_id TEXT,
+                best_streak INT DEFAULT 0,
+                best_streak_holder TEXT
+            )
+        """)
+        cur.execute("INSERT INTO counting_config (id) VALUES (1) ON CONFLICT (id) DO NOTHING")
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS counting_users (
+                user_id TEXT PRIMARY KEY,
+                display_name TEXT,
+                total_correct INT DEFAULT 0,
+                times_ruined INT DEFAULT 0
+            )
+        """)
+        conn.commit()
+        cur.close()
+        conn.close()
+        print("✅ Database ready")
+    except Exception as e:
+        print(f"⚠️ Failed to initialize database: {e}")
+
+# === Strikes/Hosting Storage (members table) ===
 def load_data():
     try:
-        with open(DATA_FILE, "r") as f:
-            return json.load(f)
-    except:
+        conn = get_db()
+        cur = conn.cursor(cursor_factory=RealDictCursor)
+        cur.execute("SELECT * FROM members")
+        rows = cur.fetchall()
+        cur.close()
+        conn.close()
+        return {
+            row["user_id"]: {
+                "display_name": row["display_name"],
+                "strikes": row["strikes"],
+                "monthly": row["monthly"] or {}
+            } for row in rows
+        }
+    except Exception as e:
+        print(f"⚠️ Failed to load members: {e}")
         return {}
 
 def save_data(data):
-    with open(DATA_FILE, "w") as f:
-        json.dump(data, f, indent=4)
+    try:
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute("DELETE FROM members")
+        for uid, rec in data.items():
+            cur.execute(
+                "INSERT INTO members (user_id, display_name, strikes, monthly) VALUES (%s, %s, %s, %s)",
+                (uid, rec["display_name"], rec["strikes"], Json(rec["monthly"]))
+            )
+        conn.commit()
+        cur.close()
+        conn.close()
+    except Exception as e:
+        print(f"⚠️ Failed to save members: {e}")
 
 def get_current_month_key():
     now = datetime.utcnow()
@@ -68,27 +137,75 @@ def ensure_member(data, member: discord.Member):
 
     return uid, month
 
-# === Counting Game Storage ===
-COUNT_FILE = "counting_data.json"
-
+# === Counting Game Storage (counting_config + counting_users tables) ===
 def load_count_data():
+    default = {
+        "channel_id": None,
+        "enabled": True,
+        "current_count": 0,
+        "last_user_id": None,
+        "best_streak": 0,
+        "best_streak_holder": None,
+        "users": {}
+    }
     try:
-        with open(COUNT_FILE, "r") as f:
-            return json.load(f)
-    except:
+        conn = get_db()
+        cur = conn.cursor(cursor_factory=RealDictCursor)
+        cur.execute("SELECT * FROM counting_config WHERE id = 1")
+        config = cur.fetchone()
+        cur.execute("SELECT * FROM counting_users")
+        user_rows = cur.fetchall()
+        cur.close()
+        conn.close()
+
+        if not config:
+            return default
+
         return {
-            "channel_id": None,
-            "enabled": True,
-            "current_count": 0,
-            "last_user_id": None,
-            "best_streak": 0,
-            "best_streak_holder": None,
-            "users": {}
+            "channel_id": config["channel_id"],
+            "enabled": config["enabled"],
+            "current_count": config["current_count"],
+            "last_user_id": config["last_user_id"],
+            "best_streak": config["best_streak"],
+            "best_streak_holder": config["best_streak_holder"],
+            "users": {
+                row["user_id"]: {
+                    "display_name": row["display_name"],
+                    "total_correct": row["total_correct"],
+                    "times_ruined": row["times_ruined"]
+                } for row in user_rows
+            }
         }
+    except Exception as e:
+        print(f"⚠️ Failed to load counting data: {e}")
+        return default
 
 def save_count_data(data):
-    with open(COUNT_FILE, "w") as f:
-        json.dump(data, f, indent=4)
+    try:
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute("""
+            UPDATE counting_config SET
+                channel_id = %s, enabled = %s, current_count = %s,
+                last_user_id = %s, best_streak = %s, best_streak_holder = %s
+            WHERE id = 1
+        """, (
+            data["channel_id"], data["enabled"], data["current_count"],
+            data["last_user_id"], data["best_streak"], data["best_streak_holder"]
+        ))
+
+        cur.execute("DELETE FROM counting_users")
+        for uid, rec in data["users"].items():
+            cur.execute(
+                "INSERT INTO counting_users (user_id, display_name, total_correct, times_ruined) VALUES (%s, %s, %s, %s)",
+                (uid, rec["display_name"], rec["total_correct"], rec["times_ruined"])
+            )
+
+        conn.commit()
+        cur.close()
+        conn.close()
+    except Exception as e:
+        print(f"⚠️ Failed to save counting data: {e}")
 
 def ensure_count_user(data, member: discord.Member):
     uid = str(member.id)
@@ -270,7 +387,7 @@ async def setcountchannel(ctx, channel: discord.TextChannel):
     count_data["last_user_id"] = None
     save_count_data(count_data)
     await ctx.send(f"🔢 Counting channel set to {channel.mention}. Next number is **1**.")
- 
+
 @bot.hybrid_command(description="Turn the counting game on or off")
 @discord.app_commands.describe(state="Turn counting on or off")
 @discord.app_commands.choices(state=[
@@ -280,25 +397,25 @@ async def setcountchannel(ctx, channel: discord.TextChannel):
 @commands.has_permissions(administrator=True)
 async def counting(ctx, state: str):
     count_data = load_count_data()
- 
+
     if state.lower() not in ("on", "off"):
         await ctx.send("❌ Use `!counting on` or `!counting off`.")
         return
- 
+
     count_data["enabled"] = (state.lower() == "on")
     save_count_data(count_data)
- 
+
     if count_data["enabled"]:
         await ctx.send("✅ Counting game turned **on**.")
     else:
         await ctx.send("🛑 Counting game turned **off**. Leaderboard and progress are kept.")
- 
+
 def build_leaderboard_embed(count_data):
     users = count_data.get("users", {})
     ranked = sorted(users.values(), key=lambda u: u["total_correct"], reverse=True)
     lines = [f"{i+1}. {u['display_name']} — {u['total_correct']} correct, {u['times_ruined']} ruined"
               for i, u in enumerate(ranked[:10])] if ranked else ["No counting data yet."]
- 
+
     embed = discord.Embed(
         title="🔢 Counting Leaderboard",
         description="\n".join(lines),
@@ -307,36 +424,36 @@ def build_leaderboard_embed(count_data):
     if count_data.get("best_streak_holder"):
         embed.set_footer(text=f"All-time record: {count_data['best_streak']} (by {count_data['best_streak_holder']})")
     return embed
- 
+
 class LeaderboardView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=120)
- 
+
     @discord.ui.button(label="Reset Leaderboard", style=discord.ButtonStyle.danger, emoji="🗑️")
     async def reset_leaderboard(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not interaction.user.guild_permissions.administrator:
             await interaction.response.send_message("🚫 Only admins can reset the leaderboard.", ephemeral=True)
             return
- 
+
         count_data = load_count_data()
         count_data["users"] = {}
         count_data["best_streak"] = 0
         count_data["best_streak_holder"] = None
         save_count_data(count_data)
- 
+
         button.disabled = True
         button.label = "Leaderboard Reset"
         await interaction.response.edit_message(embed=build_leaderboard_embed(count_data), view=self)
- 
+
     async def on_timeout(self):
         for item in self.children:
             item.disabled = True
- 
+
 @bot.hybrid_command(description="Show the counting game leaderboard")
 async def countboard(ctx):
     count_data = load_count_data()
     await ctx.send(embed=build_leaderboard_embed(count_data), view=LeaderboardView())
- 
+
 @bot.hybrid_command(name="commands", description="Show everything E3N can do")
 async def commands_list(ctx):
     embed = discord.Embed(
@@ -374,7 +491,7 @@ async def commands_list(ctx):
     )
     embed.set_footer(text="Works as ! commands or / slash commands")
     await ctx.send(embed=embed)
- 
+
 # === Error Handling ===
 @bot.event
 async def on_command_error(ctx, error):
@@ -388,7 +505,7 @@ async def on_command_error(ctx, error):
         pass
     else:
         raise error
- 
+
 # === Run Bot ===
+init_db()
 bot.run(TOKEN)
- 
