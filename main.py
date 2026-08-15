@@ -249,7 +249,9 @@ def ensure_count_user(data, member: discord.Member):
 async def on_ready():
     print(f"Bot online as {bot.user}")
     try:
-        # Global sync (can take up to an hour to show up)
+        # Clear any leftover global command registrations so they don't show
+        # up as duplicates alongside the guild-specific ones below.
+        bot.tree.clear_commands(guild=None)
         await bot.tree.sync()
 
         # Guild sync (instant) — copies commands into every server the bot is in
