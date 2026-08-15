@@ -72,24 +72,10 @@ def ensure_member(data, member: discord.Member):
 @bot.event
 async def on_ready():
     print(f"Bot online as {bot.user}")
-    try:
-        # Global sync (can take up to an hour to show up)
-        await bot.tree.sync()
-
-        # Guild sync (instant) — copies commands into every server the bot is in
-        for guild in bot.guilds:
-            bot.tree.copy_global_to(guild=guild)
-            synced = await bot.tree.sync(guild=guild)
-            print(f"Synced {len(synced)} slash command(s) to {guild.name}")
-    except Exception as e:
-        print(f"Slash command sync failed: {e}")
 
 # === Commands ===
-# hybrid_command = works as BOTH "!command" and "/command" from one definition.
-# discord.app_commands.describe() controls the text shown under each option in the slash UI.
 
-@bot.hybrid_command(description="Log hosted event(s) for a member")
-@discord.app_commands.describe(member="The member to credit", count="How many events to log (default 1)")
+@bot.command()
 @commands.has_permissions(manage_messages=True)
 async def loghost(ctx, member: discord.Member, count: int = 1):
     data = load_data()
@@ -98,8 +84,7 @@ async def loghost(ctx, member: discord.Member, count: int = 1):
     save_data(data)
     await ctx.send(f"📌 Logged {count} hosted event(s) for {data[uid]['display_name']}. This month: {data[uid]['monthly'][month]}")
 
-@bot.hybrid_command(description="Remove hosted-event log(s) for a member")
-@discord.app_commands.describe(member="The member to adjust", count="How many events to remove (default 1)")
+@bot.command()
 @commands.has_permissions(manage_messages=True)
 async def deletehost(ctx, member: discord.Member, count: int = 1):
     data = load_data()
@@ -113,8 +98,7 @@ async def deletehost(ctx, member: discord.Member, count: int = 1):
     else:
         await ctx.send(f"❌ No hosting logs to delete for {data[uid]['display_name']} this month.")
 
-@bot.hybrid_command(description="Add strike(s) to a member")
-@discord.app_commands.describe(member="The member to strike", count="How many strikes to add (default 1)")
+@bot.command()
 @commands.has_permissions(manage_messages=True)
 async def strike(ctx, member: discord.Member, count: int = 1):
     data = load_data()
@@ -123,7 +107,7 @@ async def strike(ctx, member: discord.Member, count: int = 1):
     save_data(data)
     await ctx.send(f"⚠️ Added {count} strike(s) to {data[uid]['display_name']}. Total: {data[uid]['strikes']}")
 
-@bot.hybrid_command(description="Show everyone's strike totals")
+@bot.command()
 async def strikes(ctx):
     data = load_data()
     if not data:
@@ -133,8 +117,7 @@ async def strikes(ctx):
     out = "\n".join(f"{d['display_name']}: {d['strikes']}" for d in data.values())
     await ctx.send("**Strikes:**\n" + out)
 
-@bot.hybrid_command(description="Reset a member's strikes to 0")
-@discord.app_commands.describe(member="The member to reset")
+@bot.command()
 @commands.has_permissions(manage_messages=True)
 async def resetstrikes(ctx, member: discord.Member):
     data = load_data()
@@ -143,7 +126,7 @@ async def resetstrikes(ctx, member: discord.Member):
     save_data(data)
     await ctx.send(f"✅ Strikes reset for {data[uid]['display_name']}.")
 
-@bot.hybrid_command(description="Show this month's hosting + strike totals")
+@bot.command()
 async def logs(ctx):
     data = load_data()
     if not data:
@@ -169,7 +152,7 @@ async def logs(ctx):
                    f"**Hosting:**\n" + "\n".join(host_lines) +
                    f"\n\n**Strikes:**\n" + "\n".join(strike_lines))
 
-@bot.hybrid_command(name="commands", description="Show everything E3N can do")
+@bot.command(name="commands")
 async def commands_list(ctx):
     embed = discord.Embed(
         title="🤖 E3N Commands",
@@ -195,23 +178,8 @@ async def commands_list(ctx):
         ),
         inline=False
     )
-    embed.set_footer(text="Works as ! commands or / slash commands")
+    embed.set_footer(text="Prefix: !")
     await ctx.send(embed=embed)
- 
-# === Error Handling ===
-@bot.event
-async def on_command_error(ctx, error):
-    if isinstance(error, commands.MissingPermissions):
-        await ctx.send("🚫 You don't have permission to use that command.")
-    elif isinstance(error, commands.MemberNotFound):
-        await ctx.send("❌ I couldn't find that member.")
-    elif isinstance(error, commands.MissingRequiredArgument):
-        await ctx.send(f"❌ Missing argument: `{error.param.name}`")
-    elif isinstance(error, commands.CommandNotFound):
-        pass
-    else:
-        raise error
- 
+
 # === Run Bot ===
 bot.run(TOKEN)
- 
