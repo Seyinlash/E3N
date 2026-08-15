@@ -2,3 +2,4 @@ discord.py
 flask
 python-dotenv
 psycopg2-binary
+word2number

@@ -5,11 +5,15 @@ from discord.ext import commands
 import os
 import json
 import sys
+import re
+import ast
+import operator
 import traceback
 import psycopg2
 from psycopg2.extras import RealDictCursor, Json
 from datetime import datetime
 from dotenv import load_dotenv
+from word2number import w2n
 import random
 
 # Force unbuffered stdout so Render logs show print() output immediately, in order
@@ -232,6 +236,55 @@ def save_count_data(data):
         traceback.print_exc()
         return False
 
+# === Counting: parse numbers, spelled-out words, and simple math ===
+# Only basic arithmetic is allowed — no function calls, names, or attribute
+# access — so this can never be used to run arbitrary code.
+_SAFE_OPERATORS = {
+    ast.Add: operator.add,
+    ast.Sub: operator.sub,
+    ast.Mult: operator.mul,
+    ast.Div: operator.truediv,
+    ast.Pow: operator.pow,
+    ast.USub: operator.neg,
+    ast.UAdd: operator.pos,
+}
+
+def _eval_math_node(node):
+    if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
+        return node.value
+    if isinstance(node, ast.BinOp) and type(node.op) in _SAFE_OPERATORS:
+        return _SAFE_OPERATORS[type(node.op)](_eval_math_node(node.left), _eval_math_node(node.right))
+    if isinstance(node, ast.UnaryOp) and type(node.op) in _SAFE_OPERATORS:
+        return _SAFE_OPERATORS[type(node.op)](_eval_math_node(node.operand))
+    raise ValueError("Disallowed expression")
+
+def parse_count_attempt(content):
+    """Returns an int if the message is a valid count attempt (number, math, or
+    spelled-out word), otherwise None so normal chat in the channel is ignored."""
+    text = content.strip()
+    if not text:
+        return None
+
+    # Plain integer, e.g. "501"
+    if re.fullmatch(r"-?\d+", text):
+        return int(text)
+
+    # Simple math expression, e.g. "500+1", "250*2", "(10+5)/3"
+    if re.fullmatch(r"[\d\s+\-*/().]+", text) and re.search(r"[+\-*/]", text):
+        try:
+            result = _eval_math_node(ast.parse(text, mode="eval").body)
+        except Exception:
+            return None
+        if isinstance(result, (int, float)) and float(result).is_integer():
+            return int(result)
+        return None
+
+    # Spelled-out number, e.g. "five hundred one", "twenty-one"
+    try:
+        return w2n.word_to_num(text.lower().replace("-", " "))
+    except ValueError:
+        return None
+
 def ensure_count_user(data, member: discord.Member):
     uid = str(member.id)
     if uid not in data["users"]:
@@ -279,12 +332,12 @@ async def on_message(message: discord.Message):
         return
 
     content = message.content.strip()
+    number = parse_count_attempt(content)
 
-    # Only treat plain whole numbers as count attempts; anything else is left alone
-    if not content.lstrip("-").isdigit():
+    # Not a recognized count attempt (number, math, or spelled-out word) — leave normal chat alone
+    if number is None:
         return
 
-    number = int(content)
     expected = count_data["current_count"] + 1
     uid = ensure_count_user(count_data, message.author)
 
