@@ -249,16 +249,17 @@ def ensure_count_user(data, member: discord.Member):
 async def on_ready():
     print(f"Bot online as {bot.user}")
     try:
-        # Clear any leftover global command registrations so they don't show
-        # up as duplicates alongside the guild-specific ones below.
-        bot.tree.clear_commands(guild=None)
-        await bot.tree.sync()
-
-        # Guild sync (instant) — copies commands into every server the bot is in
+        # Guild sync FIRST (instant) — copies the currently-registered commands
+        # into every server the bot is in, while they're still in the tree
         for guild in bot.guilds:
             bot.tree.copy_global_to(guild=guild)
             synced = await bot.tree.sync(guild=guild)
             print(f"Synced {len(synced)} slash command(s) to {guild.name}")
+
+        # THEN clear + sync the global scope so Discord doesn't also show a
+        # separate global copy of every command (which caused duplicates)
+        bot.tree.clear_commands(guild=None)
+        await bot.tree.sync()
     except Exception as e:
         print(f"Slash command sync failed: {e}")
 
