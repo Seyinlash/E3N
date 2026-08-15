@@ -4,11 +4,16 @@ import discord
 from discord.ext import commands
 import os
 import json
+import sys
+import traceback
 import psycopg2
 from psycopg2.extras import RealDictCursor, Json
 from datetime import datetime
 from dotenv import load_dotenv
 import random
+
+# Force unbuffered stdout so Render logs show print() output immediately, in order
+sys.stdout.reconfigure(line_buffering=True)
 
 # === Keep-Alive Server ===
 app = Flask('')
@@ -42,6 +47,8 @@ def get_db():
     return psycopg2.connect(DATABASE_URL, sslmode="require")
 
 def init_db():
+    masked = (DATABASE_URL[:40] + "...") if DATABASE_URL else "None"
+    print(f"🔌 Connecting to database: {masked}")
     try:
         conn = get_db()
         cur = conn.cursor()
@@ -79,6 +86,7 @@ def init_db():
         print("✅ Database ready")
     except Exception as e:
         print(f"⚠️ Failed to initialize database: {e}")
+        traceback.print_exc()
 
 # === Strikes/Hosting Storage (members table) ===
 def load_data():
@@ -113,8 +121,11 @@ def save_data(data):
         conn.commit()
         cur.close()
         conn.close()
+        return True
     except Exception as e:
         print(f"⚠️ Failed to save members: {e}")
+        traceback.print_exc()
+        return False
 
 def get_current_month_key():
     now = datetime.utcnow()
@@ -204,8 +215,11 @@ def save_count_data(data):
         conn.commit()
         cur.close()
         conn.close()
+        return True
     except Exception as e:
         print(f"⚠️ Failed to save counting data: {e}")
+        traceback.print_exc()
+        return False
 
 def ensure_count_user(data, member: discord.Member):
     uid = str(member.id)
@@ -303,7 +317,9 @@ async def loghost(ctx, member: discord.Member, count: int = 1):
     data = load_data()
     uid, month = ensure_member(data, member)
     data[uid]["monthly"][month] += count
-    save_data(data)
+    if not save_data(data):
+        await ctx.send("❌ Database error — the log wasn't saved. Check Render logs.")
+        return
     await ctx.send(f"📌 Logged {count} hosted event(s) for {data[uid]['display_name']}. This month: {data[uid]['monthly'][month]}")
 
 @bot.hybrid_command(description="Remove hosted-event log(s) for a member")
@@ -316,7 +332,9 @@ async def deletehost(ctx, member: discord.Member, count: int = 1):
     if current_count > 0:
         removed = min(count, current_count)
         data[uid]["monthly"][month] -= removed
-        save_data(data)
+        if not save_data(data):
+            await ctx.send("❌ Database error — the change wasn't saved. Check Render logs.")
+            return
         await ctx.send(f"🗑️ Removed {removed} hosting log(s) for {data[uid]['display_name']}. Now: {data[uid]['monthly'][month]}")
     else:
         await ctx.send(f"❌ No hosting logs to delete for {data[uid]['display_name']} this month.")
@@ -328,7 +346,9 @@ async def strike(ctx, member: discord.Member, count: int = 1):
     data = load_data()
     uid, _ = ensure_member(data, member)
     data[uid]["strikes"] += count
-    save_data(data)
+    if not save_data(data):
+        await ctx.send("❌ Database error — the strike wasn't saved. Check Render logs.")
+        return
     await ctx.send(f"⚠️ Added {count} strike(s) to {data[uid]['display_name']}. Total: {data[uid]['strikes']}")
 
 @bot.hybrid_command(description="Show everyone's strike totals")
@@ -348,7 +368,9 @@ async def resetstrikes(ctx, member: discord.Member):
     data = load_data()
     uid, _ = ensure_member(data, member)
     data[uid]["strikes"] = 0
-    save_data(data)
+    if not save_data(data):
+        await ctx.send("❌ Database error — the reset wasn't saved. Check Render logs.")
+        return
     await ctx.send(f"✅ Strikes reset for {data[uid]['display_name']}.")
 
 @bot.hybrid_command(description="Show this month's hosting + strike totals")
@@ -385,7 +407,9 @@ async def setcountchannel(ctx, channel: discord.TextChannel):
     count_data["channel_id"] = channel.id
     count_data["current_count"] = 0
     count_data["last_user_id"] = None
-    save_count_data(count_data)
+    if not save_count_data(count_data):
+        await ctx.send("❌ Database error — the channel wasn't saved. Check Render logs.")
+        return
     await ctx.send(f"🔢 Counting channel set to {channel.mention}. Next number is **1**.")
 
 @bot.hybrid_command(description="Turn the counting game on or off")
