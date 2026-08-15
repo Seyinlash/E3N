@@ -7,6 +7,7 @@ import json
 import sys
 import re
 import ast
+import asyncio
 import operator
 import traceback
 import psycopg2
@@ -56,6 +57,11 @@ intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
 bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
+
+# Serializes counting-channel message handling so simultaneous messages can't
+# both read the same "current count" before either one saves — prevents race
+# conditions when multiple people type at nearly the same moment.
+counting_lock = asyncio.Lock()
 
 # === Database Setup ===
 def get_db():
@@ -324,54 +330,56 @@ async def on_message(message: discord.Message):
     if message.author.bot:
         return
 
-    count_data = load_count_data()
-    channel_id = count_data.get("channel_id")
-
-    # Counting turned off, no channel set, or this message isn't in it
-    if not count_data.get("enabled", True) or channel_id is None or message.channel.id != channel_id:
-        return
-
+    # Quick parse before touching the lock/DB — normal chat never contends for the lock
     content = message.content.strip()
     number = parse_count_attempt(content)
-
-    # Not a recognized count attempt (number, math, or spelled-out word) — leave normal chat alone
     if number is None:
         return
 
-    expected = count_data["current_count"] + 1
-    uid = ensure_count_user(count_data, message.author)
+    # Serialize the whole read -> check -> write cycle so two near-simultaneous
+    # messages can never both act on the same stale "current count".
+    async with counting_lock:
+        count_data = load_count_data()
+        channel_id = count_data.get("channel_id")
 
-    same_user_twice = count_data["last_user_id"] == str(message.author.id)
-    wrong_number = number != expected
+        # Counting turned off, no channel set, or this message isn't in it
+        if not count_data.get("enabled", True) or channel_id is None or message.channel.id != channel_id:
+            return
 
-    if same_user_twice or wrong_number:
-        # Break the chain: react X, reset to 0 so next valid number is 1, don't delete the message
+        expected = count_data["current_count"] + 1
+        uid = ensure_count_user(count_data, message.author)
+
+        same_user_twice = count_data["last_user_id"] == str(message.author.id)
+        wrong_number = number != expected
+
+        if same_user_twice or wrong_number:
+            # Break the chain: react X, reset to 0 so next valid number is 1, don't delete the message
+            try:
+                await message.add_reaction("❌")
+            except discord.HTTPException:
+                pass
+            count_data["users"][uid]["times_ruined"] += 1
+            count_data["current_count"] = 0
+            count_data["last_user_id"] = None
+            save_count_data(count_data)
+            reason = "you counted twice in a row" if same_user_twice else f"expected {expected}"
+            await message.channel.send(f"❌ Count broken by {message.author.display_name} ({reason}). Starting over — next number is **1**.")
+            return
+
+        # Correct count
         try:
-            await message.add_reaction("❌")
+            await message.add_reaction("✅")
         except discord.HTTPException:
             pass
-        count_data["users"][uid]["times_ruined"] += 1
-        count_data["current_count"] = 0
-        count_data["last_user_id"] = None
+        count_data["current_count"] = number
+        count_data["last_user_id"] = str(message.author.id)
+        count_data["users"][uid]["total_correct"] += 1
+
+        if number > count_data["best_streak"]:
+            count_data["best_streak"] = number
+            count_data["best_streak_holder"] = message.author.display_name
+
         save_count_data(count_data)
-        reason = "you counted twice in a row" if same_user_twice else f"expected {expected}"
-        await message.channel.send(f"❌ Count broken by {message.author.display_name} ({reason}). Starting over — next number is **1**.")
-        return
-
-    # Correct count
-    try:
-        await message.add_reaction("✅")
-    except discord.HTTPException:
-        pass
-    count_data["current_count"] = number
-    count_data["last_user_id"] = str(message.author.id)
-    count_data["users"][uid]["total_correct"] += 1
-
-    if number > count_data["best_streak"]:
-        count_data["best_streak"] = number
-        count_data["best_streak_holder"] = message.author.display_name
-
-    save_count_data(count_data)
 
 # === Commands ===
 # hybrid_command = works as BOTH "!command" and "/command" from one definition.
