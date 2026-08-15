@@ -78,6 +78,7 @@ def load_count_data():
     except:
         return {
             "channel_id": None,
+            "enabled": True,
             "current_count": 0,
             "last_user_id": None,
             "best_streak": 0,
@@ -128,8 +129,8 @@ async def on_message(message: discord.Message):
     count_data = load_count_data()
     channel_id = count_data.get("channel_id")
 
-    # No counting channel set, or this message isn't in it
-    if channel_id is None or message.channel.id != channel_id:
+    # Counting turned off, no channel set, or this message isn't in it
+    if not count_data.get("enabled", True) or channel_id is None or message.channel.id != channel_id:
         return
 
     content = message.content.strip()
@@ -270,18 +271,33 @@ async def setcountchannel(ctx, channel: discord.TextChannel):
     save_count_data(count_data)
     await ctx.send(f"🔢 Counting channel set to {channel.mention}. Next number is **1**.")
  
-@bot.hybrid_command(description="Show the counting game leaderboard")
-async def countboard(ctx):
+@bot.hybrid_command(description="Turn the counting game on or off")
+@discord.app_commands.describe(state="Turn counting on or off")
+@discord.app_commands.choices(state=[
+    discord.app_commands.Choice(name="on", value="on"),
+    discord.app_commands.Choice(name="off", value="off"),
+])
+@commands.has_permissions(administrator=True)
+async def counting(ctx, state: str):
     count_data = load_count_data()
-    users = count_data.get("users", {})
  
-    if not users:
-        await ctx.send("📭 No counting data yet.")
+    if state.lower() not in ("on", "off"):
+        await ctx.send("❌ Use `!counting on` or `!counting off`.")
         return
  
+    count_data["enabled"] = (state.lower() == "on")
+    save_count_data(count_data)
+ 
+    if count_data["enabled"]:
+        await ctx.send("✅ Counting game turned **on**.")
+    else:
+        await ctx.send("🛑 Counting game turned **off**. Leaderboard and progress are kept.")
+ 
+def build_leaderboard_embed(count_data):
+    users = count_data.get("users", {})
     ranked = sorted(users.values(), key=lambda u: u["total_correct"], reverse=True)
     lines = [f"{i+1}. {u['display_name']} — {u['total_correct']} correct, {u['times_ruined']} ruined"
-              for i, u in enumerate(ranked[:10])]
+              for i, u in enumerate(ranked[:10])] if ranked else ["No counting data yet."]
  
     embed = discord.Embed(
         title="🔢 Counting Leaderboard",
@@ -290,7 +306,36 @@ async def countboard(ctx):
     )
     if count_data.get("best_streak_holder"):
         embed.set_footer(text=f"All-time record: {count_data['best_streak']} (by {count_data['best_streak_holder']})")
-    await ctx.send(embed=embed)
+    return embed
+ 
+class LeaderboardView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=120)
+ 
+    @discord.ui.button(label="Reset Leaderboard", style=discord.ButtonStyle.danger, emoji="🗑️")
+    async def reset_leaderboard(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not interaction.user.guild_permissions.administrator:
+            await interaction.response.send_message("🚫 Only admins can reset the leaderboard.", ephemeral=True)
+            return
+ 
+        count_data = load_count_data()
+        count_data["users"] = {}
+        count_data["best_streak"] = 0
+        count_data["best_streak_holder"] = None
+        save_count_data(count_data)
+ 
+        button.disabled = True
+        button.label = "Leaderboard Reset"
+        await interaction.response.edit_message(embed=build_leaderboard_embed(count_data), view=self)
+ 
+    async def on_timeout(self):
+        for item in self.children:
+            item.disabled = True
+ 
+@bot.hybrid_command(description="Show the counting game leaderboard")
+async def countboard(ctx):
+    count_data = load_count_data()
+    await ctx.send(embed=build_leaderboard_embed(count_data), view=LeaderboardView())
  
 @bot.hybrid_command(name="commands", description="Show everything E3N can do")
 async def commands_list(ctx):
@@ -321,7 +366,10 @@ async def commands_list(ctx):
     )
     embed.add_field(
         name="🛡️ Admin Only (requires Administrator)",
-        value="`!setcountchannel #channel` — Set the channel used for the counting game",
+        value=(
+            "`!setcountchannel #channel` — Set the channel used for the counting game\n"
+            "`!counting on/off` — Turn the counting game on or off"
+        ),
         inline=False
     )
     embed.set_footer(text="Works as ! commands or / slash commands")
