@@ -1,4 +1,3 @@
-
 from flask import Flask
 from threading import Thread
 import discord
@@ -74,8 +73,14 @@ def ensure_member(data, member: discord.Member):
 async def on_ready():
     print(f"Bot online as {bot.user}")
     try:
-        synced = await bot.tree.sync()
-        print(f"Synced {len(synced)} slash command(s)")
+        # Global sync (can take up to an hour to show up)
+        await bot.tree.sync()
+
+        # Guild sync (instant) — copies commands into every server the bot is in
+        for guild in bot.guilds:
+            bot.tree.copy_global_to(guild=guild)
+            synced = await bot.tree.sync(guild=guild)
+            print(f"Synced {len(synced)} slash command(s) to {guild.name}")
     except Exception as e:
         print(f"Slash command sync failed: {e}")
 
@@ -209,3 +214,4 @@ async def on_command_error(ctx, error):
  
 # === Run Bot ===
 bot.run(TOKEN)
+ 
