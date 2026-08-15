@@ -32,7 +32,7 @@ TOKEN = os.getenv("DISCORD_TOKEN")
 intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
-bot = commands.Bot(command_prefix="!", intents=intents)
+bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
 
 DATA_FILE = "log_data.json"
 
@@ -151,6 +151,35 @@ async def logs(ctx):
     await ctx.send(f"🧾 **{datetime.utcnow().strftime('%B')} Logs**\n\n"
                    f"**Hosting:**\n" + "\n".join(host_lines) +
                    f"\n\n**Strikes:**\n" + "\n".join(strike_lines))
+
+@bot.command(name="commands")
+async def commands_list(ctx):
+    embed = discord.Embed(
+        title="🤖 E3N Commands",
+        description="Here's everything I can do:",
+        color=discord.Color.blurple()
+    )
+    embed.add_field(
+        name="📋 Everyone",
+        value=(
+            "`!strikes` — Show everyone's strike totals\n"
+            "`!logs` — Show this month's hosting + strike totals\n"
+            "`!commands` — Show this message"
+        ),
+        inline=False
+    )
+    embed.add_field(
+        name="🔧 Moderator Only (requires Manage Messages)",
+        value=(
+            "`!loghost @member [count]` — Log hosted event(s) for a member (default 1)\n"
+            "`!deletehost @member [count]` — Remove hosted-event log(s) for a member (default 1)\n"
+            "`!strike @member [count]` — Add strike(s) to a member (default 1)\n"
+            "`!resetstrikes @member` — Reset a member's strikes to 0"
+        ),
+        inline=False
+    )
+    embed.set_footer(text="Prefix: !")
+    await ctx.send(embed=embed)
 
 # === Run Bot ===
 bot.run(TOKEN)
