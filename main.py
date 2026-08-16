@@ -101,6 +101,13 @@ def init_db():
                 times_ruined INT DEFAULT 0
             )
         """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS bot_settings (
+                id INT PRIMARY KEY DEFAULT 1,
+                log_channel_id BIGINT
+            )
+        """)
+        cur.execute("INSERT INTO bot_settings (id) VALUES (1) ON CONFLICT (id) DO NOTHING")
         conn.commit()
         cur.close()
         conn.close()
@@ -291,6 +298,38 @@ def parse_count_attempt(content):
     except ValueError:
         return None
 
+# === Bot Settings Storage (bot_settings table) ===
+def load_bot_settings():
+    try:
+        conn = get_db()
+        cur = conn.cursor(cursor_factory=RealDictCursor)
+        cur.execute("SELECT * FROM bot_settings WHERE id = 1")
+        row = cur.fetchone()
+        cur.close()
+        conn.close()
+        return {"log_channel_id": row["log_channel_id"] if row else None}
+    except Exception as e:
+        print(f"⚠️ Failed to load bot settings: {e}")
+        traceback.print_exc()
+        return {"log_channel_id": None}
+
+def save_bot_settings(settings):
+    try:
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute(
+            "UPDATE bot_settings SET log_channel_id = %s WHERE id = 1",
+            (settings.get("log_channel_id"),)
+        )
+        conn.commit()
+        cur.close()
+        conn.close()
+        return True
+    except Exception as e:
+        print(f"⚠️ Failed to save bot settings: {e}")
+        traceback.print_exc()
+        return False
+
 def ensure_count_user(data, member: discord.Member):
     uid = str(member.id)
     if uid not in data["users"]:
@@ -321,6 +360,31 @@ async def on_ready():
         await bot.tree.sync()
     except Exception as e:
         print(f"Slash command sync failed: {e}")
+
+@bot.after_invoke
+async def log_command_usage(ctx):
+    try:
+        settings = load_bot_settings()
+        channel_id = settings.get("log_channel_id")
+        if not channel_id:
+            return
+        channel = bot.get_channel(channel_id)
+        if not channel:
+            return
+
+        args_display = " ".join(str(a) for a in ctx.args[2:]) if len(ctx.args) > 2 else ""
+        kwargs_display = " ".join(f"{k}={v}" for k, v in ctx.kwargs.items())
+        extra = " ".join(filter(None, [args_display, kwargs_display]))
+
+        source_channel = ctx.channel.mention if ctx.guild else "DM"
+        msg = f"📝 **{ctx.author}** used `!{ctx.command}`"
+        if extra:
+            msg += f" `{extra}`"
+        msg += f" in {source_channel}"
+
+        await channel.send(msg)
+    except Exception as e:
+        print(f"⚠️ Failed to log command usage: {e}")
 
 @bot.event
 async def on_message(message: discord.Message):
@@ -474,6 +538,61 @@ async def logs(ctx):
                    f"**Hosting:**\n" + "\n".join(host_lines) +
                    f"\n\n**Strikes:**\n" + "\n".join(strike_lines))
 
+@bot.hybrid_command(description="Show info about a server member")
+@discord.app_commands.describe(member="The member to look up (defaults to you)")
+async def userinfo(ctx, member: discord.Member = None):
+    member = member or ctx.author
+
+    roles = [r.mention for r in member.roles if r.name != "@everyone"]
+    roles.reverse()  # highest role first
+    roles_display = ", ".join(roles) if roles else "None"
+    if len(roles_display) > 1000:
+        roles_display = f"{len(roles)} roles (too many to list)"
+
+    embed = discord.Embed(
+        title=f"👤 {member.display_name}",
+        color=member.color if member.color.value else discord.Color.blurple()
+    )
+    embed.set_thumbnail(url=member.display_avatar.url)
+    embed.add_field(name="Username", value=str(member), inline=True)
+    embed.add_field(name="ID", value=str(member.id), inline=True)
+    embed.add_field(name="Bot?", value="Yes" if member.bot else "No", inline=True)
+    embed.add_field(name="Account created", value=discord.utils.format_dt(member.created_at, style="R"), inline=True)
+    embed.add_field(name="Joined server", value=discord.utils.format_dt(member.joined_at, style="R") if member.joined_at else "Unknown", inline=True)
+    embed.add_field(name="Top role", value=member.top_role.mention if member.top_role.name != "@everyone" else "None", inline=True)
+    embed.add_field(name=f"Roles ({len(roles)})", value=roles_display, inline=False)
+    await ctx.send(embed=embed)
+
+@bot.hybrid_command(description="Show info about a role")
+@discord.app_commands.describe(role="The role to look up")
+async def roleinfo(ctx, role: discord.Role):
+    embed = discord.Embed(
+        title=f"🏷️ {role.name}",
+        color=role.color if role.color.value else discord.Color.light_grey()
+    )
+    embed.add_field(name="ID", value=str(role.id), inline=True)
+    embed.add_field(name="Color", value=str(role.color) if role.color.value else "Default", inline=True)
+    embed.add_field(name="Members", value=str(len(role.members)), inline=True)
+    embed.add_field(name="Position", value=str(role.position), inline=True)
+    embed.add_field(name="Mentionable", value="Yes" if role.mentionable else "No", inline=True)
+    embed.add_field(name="Shown separately", value="Yes" if role.hoist else "No", inline=True)
+    embed.add_field(name="Created", value=discord.utils.format_dt(role.created_at, style="R"), inline=True)
+    await ctx.send(embed=embed)
+
+@bot.hybrid_command(description="Set the channel where all command usage gets logged (server owner only)")
+@discord.app_commands.describe(channel="The channel to send the command usage log to")
+async def setlogchannel(ctx, channel: discord.TextChannel):
+    if ctx.guild is None or ctx.author.id != ctx.guild.owner_id:
+        await ctx.send("🚫 Only the server owner can use this command.")
+        return
+
+    settings = load_bot_settings()
+    settings["log_channel_id"] = channel.id
+    if not save_bot_settings(settings):
+        await ctx.send("❌ Database error — the log channel wasn't saved. Check Render logs.")
+        return
+    await ctx.send(f"📝 Command usage will now be logged to {channel.mention}.")
+
 @bot.hybrid_command(description="Set the channel used for the counting game")
 @discord.app_commands.describe(channel="The channel to use for counting")
 @commands.has_permissions(administrator=True)
@@ -566,6 +685,8 @@ async def commands_list(ctx):
             "`!strikes` — Show everyone's strike totals\n"
             "`!logs` — Show this month's hosting + strike totals\n"
             "`!countboard` — Show the counting game leaderboard\n"
+            "`!userinfo [@member]` — Show info about a member (defaults to you)\n"
+            "`!roleinfo @role` — Show info about a role\n"
             "`!commands` — Show this message"
         ),
         inline=False
@@ -586,6 +707,11 @@ async def commands_list(ctx):
             "`!setcountchannel #channel` — Set the channel used for the counting game\n"
             "`!counting on/off` — Turn the counting game on or off"
         ),
+        inline=False
+    )
+    embed.add_field(
+        name="👑 Server Owner Only",
+        value="`!setlogchannel #channel` — Set the channel where all command usage gets logged",
         inline=False
     )
     embed.set_footer(text="Works as ! commands or / slash commands")
