@@ -1,4 +1,4 @@
-from flask import Flask, request, session, redirect, url_for, render_template_string
+from flask import Flask
 from threading import Thread
 import discord
 from discord.ext import commands
@@ -9,7 +9,6 @@ import re
 import ast
 import asyncio
 import operator
-import secrets
 import traceback
 import psycopg2
 from psycopg2.extras import RealDictCursor, Json
@@ -21,154 +20,12 @@ import random
 # Force unbuffered stdout so Render logs show print() output immediately, in order
 sys.stdout.reconfigure(line_buffering=True)
 
-# === Keep-Alive Server + Dashboard ===
+# === Keep-Alive Server ===
 app = Flask('')
-# Random each time the bot restarts — this just signs the login cookie, it
-# doesn't need to be remembered, but it does mean everyone gets logged out
-# of the dashboard whenever the bot redeploys/restarts.
-app.secret_key = secrets.token_hex(32)
-
-DASHBOARD_PASSWORD = os.getenv("DASHBOARD_PASSWORD")
 
 @app.route('/')
 def home():
     return "Bot is running."
-
-LOGIN_PAGE = """
-<!DOCTYPE html>
-<html><head><title>E3N Dashboard - Login</title>
-<style>
-  body { background:#1e1f22; color:#e3e5e8; font-family:-apple-system,sans-serif;
-         display:flex; align-items:center; justify-content:center; height:100vh; margin:0; }
-  .box { background:#2b2d31; padding:32px; border-radius:12px; width:280px; text-align:center; }
-  h1 { font-size:20px; margin-bottom:20px; }
-  input { width:100%; padding:10px; border-radius:6px; border:none; margin-bottom:12px;
-          background:#1e1f22; color:#e3e5e8; box-sizing:border-box; }
-  button { width:100%; padding:10px; border-radius:6px; border:none; background:#5865f2;
-           color:white; font-weight:600; cursor:pointer; }
-  button:hover { background:#4752c4; }
-  .error { color:#f23f42; margin-bottom:12px; font-size:14px; }
-</style></head>
-<body>
-  <div class="box">
-    <h1>🤖 E3N Dashboard</h1>
-    {% if error %}<div class="error">{{ error }}</div>{% endif %}
-    <form method="POST">
-      <input type="password" name="password" placeholder="Password" autofocus>
-      <button type="submit">Log In</button>
-    </form>
-  </div>
-</body></html>
-"""
-
-DASHBOARD_PAGE = """
-<!DOCTYPE html>
-<html><head><title>E3N Dashboard</title>
-<style>
-  body { background:#1e1f22; color:#e3e5e8; font-family:-apple-system,sans-serif; margin:0; padding:24px; }
-  .header { display:flex; justify-content:space-between; align-items:center; margin-bottom:24px; }
-  h1 { font-size:22px; margin:0; }
-  a.logout { color:#f23f42; text-decoration:none; font-size:14px; }
-  .grid { display:grid; grid-template-columns:repeat(auto-fit, minmax(280px, 1fr)); gap:16px; margin-bottom:16px; }
-  .card { background:#2b2d31; border-radius:10px; padding:18px; }
-  .card h2 { font-size:16px; margin:0 0 12px 0; color:#b5bac1; }
-  table { width:100%; border-collapse:collapse; font-size:14px; }
-  th, td { text-align:left; padding:6px 4px; border-bottom:1px solid #3a3c41; }
-  th { color:#949ba4; font-weight:600; }
-  .online { color:#23a55a; font-weight:600; }
-  .offline { color:#f23f42; font-weight:600; }
-</style></head>
-<body>
-  <div class="header">
-    <h1>🤖 E3N Dashboard</h1>
-    <a class="logout" href="{{ url_for('logout') }}">Log out</a>
-  </div>
-
-  <div class="grid">
-    <div class="card">
-      <h2>Bot Status</h2>
-      <p>Status: <span class="{{ 'online' if bot_online else 'offline' }}">{{ 'Online' if bot_online else 'Offline' }}</span></p>
-      <p>Logged in as: {{ bot_user }}</p>
-      <p>Servers: {{ guild_count }}</p>
-    </div>
-    <div class="card">
-      <h2>Counting Game</h2>
-      <p>Current count: <strong>{{ count_data.current_count }}</strong></p>
-      <p>Channel set: {{ 'Yes' if count_data.channel_id else 'No' }}</p>
-      <p>Enabled: {{ 'Yes' if count_data.enabled else 'No' }}</p>
-      <p>All-time record: {{ count_data.best_streak }}{% if count_data.best_streak_holder %} (by {{ count_data.best_streak_holder }}){% endif %}</p>
-    </div>
-  </div>
-
-  <div class="grid">
-    <div class="card">
-      <h2>Counting Leaderboard</h2>
-      <table>
-        <tr><th>#</th><th>Name</th><th>Correct</th><th>Ruined</th></tr>
-        {% for u in leaderboard %}
-        <tr><td>{{ loop.index }}</td><td>{{ u.display_name }}</td><td>{{ u.total_correct }}</td><td>{{ u.times_ruined }}</td></tr>
-        {% else %}
-        <tr><td colspan="4">No data yet.</td></tr>
-        {% endfor %}
-      </table>
-    </div>
-    <div class="card">
-      <h2>Strikes &amp; Hosting ({{ month }})</h2>
-      <table>
-        <tr><th>Name</th><th>Strikes</th><th>Hosted</th></tr>
-        {% for m in members_data.values() %}
-        <tr><td>{{ m.display_name }}</td><td>{{ m.strikes }}</td><td>{{ m.monthly.get(month, 0) }}</td></tr>
-        {% else %}
-        <tr><td colspan="3">No data yet.</td></tr>
-        {% endfor %}
-      </table>
-    </div>
-  </div>
-</body></html>
-"""
-
-@app.route('/login', methods=['GET', 'POST'])
-def login():
-    if not DASHBOARD_PASSWORD:
-        return "⚠️ DASHBOARD_PASSWORD isn't set in Render's environment variables yet.", 503
-
-    error = None
-    if request.method == 'POST':
-        if request.form.get('password') == DASHBOARD_PASSWORD:
-            session['authenticated'] = True
-            return redirect(url_for('dashboard'))
-        error = "Incorrect password."
-    return render_template_string(LOGIN_PAGE, error=error)
-
-@app.route('/logout')
-def logout():
-    session.pop('authenticated', None)
-    return redirect(url_for('login'))
-
-@app.route('/dashboard')
-def dashboard():
-    if not session.get('authenticated'):
-        return redirect(url_for('login'))
-
-    # `bot`, `load_data`, `load_count_data`, and `get_current_month_key` are all
-    # defined further down in this file — that's fine, Python only looks them up
-    # when this function actually runs (i.e. when someone visits the page),
-    # by which point the whole file has already finished loading.
-    bot_online = bot.is_ready()
-    bot_user = str(bot.user) if bot.user else "Not connected yet"
-    guild_count = len(bot.guilds) if bot.is_ready() else 0
-
-    members_data = load_data()
-    month = get_current_month_key()
-    count_data = load_count_data()
-    leaderboard = sorted(count_data.get("users", {}).values(), key=lambda u: u["total_correct"], reverse=True)[:10]
-
-    return render_template_string(
-        DASHBOARD_PAGE,
-        bot_online=bot_online, bot_user=bot_user, guild_count=guild_count,
-        members_data=members_data, month=month,
-        count_data=count_data, leaderboard=leaderboard
-    )
 
 def run():
     app.run(host='0.0.0.0', port=8080)
