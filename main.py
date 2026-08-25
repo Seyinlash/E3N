@@ -65,14 +65,19 @@ counting_lock = asyncio.Lock()
 
 # === Database Setup ===
 def get_db():
+    # Opens one connection to Supabase. sslmode="require" is needed because
+    # Supabase only accepts encrypted connections.
     return psycopg2.connect(DATABASE_URL, sslmode="require")
 
 def init_db():
+    # Runs once when the bot starts. Creates every table the bot needs if
+    # they don't already exist — safe to run every time, won't wipe data.
     masked = (DATABASE_URL[:40] + "...") if DATABASE_URL else "None"
     print(f"🔌 Connecting to database: {masked}")
     try:
         conn = get_db()
         cur = conn.cursor()
+        # Strikes + hosting log data, one row per Discord member
         cur.execute("""
             CREATE TABLE IF NOT EXISTS members (
                 user_id TEXT PRIMARY KEY,
@@ -81,6 +86,8 @@ def init_db():
                 monthly JSONB DEFAULT '{}'::jsonb
             )
         """)
+        # Counting game settings — only ever one row (id=1), acts like a
+        # single save-slot for "what channel, what number are we on, etc."
         cur.execute("""
             CREATE TABLE IF NOT EXISTS counting_config (
                 id INT PRIMARY KEY DEFAULT 1,
@@ -93,6 +100,7 @@ def init_db():
             )
         """)
         cur.execute("INSERT INTO counting_config (id) VALUES (1) ON CONFLICT (id) DO NOTHING")
+        # Counting leaderboard stats, one row per person who's ever counted
         cur.execute("""
             CREATE TABLE IF NOT EXISTS counting_users (
                 user_id TEXT PRIMARY KEY,
@@ -101,6 +109,8 @@ def init_db():
                 times_ruined INT DEFAULT 0
             )
         """)
+        # General bot settings — right now just the command-log channel.
+        # Also a single-row table like counting_config above.
         cur.execute("""
             CREATE TABLE IF NOT EXISTS bot_settings (
                 id INT PRIMARY KEY DEFAULT 1,
@@ -118,6 +128,8 @@ def init_db():
 
 # === Strikes/Hosting Storage (members table) ===
 def load_data():
+    # Pulls every member's strikes/hosting record out of the database and
+    # returns it as one big dict, keyed by their Discord user ID.
     try:
         conn = get_db()
         cur = conn.cursor(cursor_factory=RealDictCursor)
@@ -137,6 +149,9 @@ def load_data():
         return {}
 
 def save_data(data):
+    # Wipes the members table and re-writes it from scratch using whatever
+    # is currently in `data`. Simple but effective for a server this size.
+    # Returns True/False so commands can tell the user if a save failed.
     try:
         conn = get_db()
         cur = conn.cursor()
@@ -156,10 +171,13 @@ def save_data(data):
         return False
 
 def get_current_month_key():
+    # Returns something like "2026-08" so hosting counts reset naturally each month.
     now = datetime.utcnow()
     return now.strftime("%Y-%m")
 
 def ensure_member(data, member: discord.Member):
+    # Makes sure this Discord member has a record in `data` before we try to
+    # edit their strikes/hosting numbers — creates one if it's their first time.
     uid = str(member.id)
     if uid not in data:
         data[uid] = {
@@ -178,6 +196,8 @@ def ensure_member(data, member: discord.Member):
 
 # === Counting Game Storage (counting_config + counting_users tables) ===
 def load_count_data():
+    # Pulls the counting game's current state (channel, count, streaks) plus
+    # everyone's leaderboard stats, and combines them into one dict to work with.
     default = {
         "channel_id": None,
         "enabled": True,
@@ -220,6 +240,8 @@ def load_count_data():
         return default
 
 def save_count_data(data):
+    # Saves the counting game's state back to the database: updates the single
+    # config row, then wipes + re-writes the leaderboard rows from `data["users"]`.
     try:
         conn = get_db()
         cur = conn.cursor()
@@ -263,6 +285,9 @@ _SAFE_OPERATORS = {
 }
 
 def _eval_math_node(node):
+    # Walks the parsed math expression piece by piece and computes the result,
+    # only allowing the operators listed above. This is what makes "500+1"
+    # safe to evaluate — unlike Python's built-in eval(), it can't run code.
     if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
         return node.value
     if isinstance(node, ast.BinOp) and type(node.op) in _SAFE_OPERATORS:
@@ -300,6 +325,8 @@ def parse_count_attempt(content):
 
 # === Bot Settings Storage (bot_settings table) ===
 def load_bot_settings():
+    # Right now this only holds the command-log channel, but it's built to
+    # easily hold more server-wide settings later if you want to add them.
     try:
         conn = get_db()
         cur = conn.cursor(cursor_factory=RealDictCursor)
@@ -331,6 +358,8 @@ def save_bot_settings(settings):
         return False
 
 def ensure_count_user(data, member: discord.Member):
+    # Same idea as ensure_member() above, but for the counting leaderboard —
+    # gives this person a leaderboard entry if they don't already have one.
     uid = str(member.id)
     if uid not in data["users"]:
         data["users"][uid] = {
@@ -345,6 +374,8 @@ def ensure_count_user(data, member: discord.Member):
 # === Events ===
 @bot.event
 async def on_ready():
+    # Fires once the bot has fully connected to Discord. This is also where
+    # we register all the slash ("/") commands so they show up in Discord's UI.
     print(f"Bot online as {bot.user}")
     try:
         # Guild sync FIRST (instant) — copies the currently-registered commands
@@ -363,6 +394,9 @@ async def on_ready():
 
 @bot.after_invoke
 async def log_command_usage(ctx):
+    # Runs automatically after EVERY command finishes (any command, from
+    # anyone) — posts a short summary to the log channel set with !setlogchannel.
+    # If no log channel has been set, this just quietly does nothing.
     try:
         settings = load_bot_settings()
         channel_id = settings.get("log_channel_id")
@@ -388,6 +422,8 @@ async def log_command_usage(ctx):
 
 @bot.event
 async def on_message(message: discord.Message):
+    # This fires on every single message sent anywhere in the server, so it
+    # doubles as both the command handler AND the counting game logic.
     # Always let normal command processing happen (! and / prefix commands)
     await bot.process_commands(message)
 
@@ -430,7 +466,8 @@ async def on_message(message: discord.Message):
             await message.channel.send(f"❌ Count broken by {message.author.display_name} ({reason}). Starting over — next number is **1**.")
             return
 
-        # Correct count
+        # Correct count — update the running total, streak record, and this
+        # person's leaderboard stats, then save everything back to the database
         try:
             await message.add_reaction("✅")
         except discord.HTTPException:
@@ -445,10 +482,21 @@ async def on_message(message: discord.Message):
 
         save_count_data(count_data)
 
+        # Milestone celebration — every 100 gets extra fanfare
+        if number % 100 == 0:
+            try:
+                await message.add_reaction("🎉")
+            except discord.HTTPException:
+                pass
+            await message.channel.send(
+                f"🎉 **{number}** reached by {message.author.mention}! Great work, everyone. Keep it going!"
+            )
+
 # === Commands ===
 # hybrid_command = works as BOTH "!command" and "/command" from one definition.
 # discord.app_commands.describe() controls the text shown under each option in the slash UI.
 
+# --- Hosting log commands (moderator only) ---
 @bot.hybrid_command(description="Log hosted event(s) for a member")
 @discord.app_commands.describe(member="The member to credit", count="How many events to log (default 1)")
 @commands.has_permissions(manage_messages=True)
@@ -478,6 +526,7 @@ async def deletehost(ctx, member: discord.Member, count: int = 1):
     else:
         await ctx.send(f"❌ No hosting logs to delete for {data[uid]['display_name']} this month.")
 
+# --- Strike commands (moderator only, plus one everyone can view) ---
 @bot.hybrid_command(description="Add strike(s) to a member")
 @discord.app_commands.describe(member="The member to strike", count="How many strikes to add (default 1)")
 @commands.has_permissions(manage_messages=True)
@@ -538,6 +587,7 @@ async def logs(ctx):
                    f"**Hosting:**\n" + "\n".join(host_lines) +
                    f"\n\n**Strikes:**\n" + "\n".join(strike_lines))
 
+# --- Info-lookup commands (open to everyone) ---
 @bot.hybrid_command(description="Show info about a server member")
 @discord.app_commands.describe(member="The member to look up (defaults to you)")
 async def userinfo(ctx, member: discord.Member = None):
@@ -579,6 +629,7 @@ async def roleinfo(ctx, role: discord.Role):
     embed.add_field(name="Created", value=discord.utils.format_dt(role.created_at, style="R"), inline=True)
     await ctx.send(embed=embed)
 
+# --- Admin/owner settings commands ---
 @bot.hybrid_command(description="Set the channel where all command usage gets logged (server owner only)")
 @discord.app_commands.describe(channel="The channel to send the command usage log to")
 async def setlogchannel(ctx, channel: discord.TextChannel):
@@ -628,7 +679,10 @@ async def counting(ctx, state: str):
     else:
         await ctx.send("🛑 Counting game turned **off**. Leaderboard and progress are kept.")
 
+# --- Leaderboard display + its reset button ---
 def build_leaderboard_embed(count_data):
+    # Builds the top-10 leaderboard embed. Pulled into its own function since
+    # both !countboard and the reset button below need to redraw this same embed.
     users = count_data.get("users", {})
     ranked = sorted(users.values(), key=lambda u: u["total_correct"], reverse=True)
     lines = [f"{i+1}. {u['display_name']} — {u['total_correct']} correct, {u['times_ruined']} ruined"
@@ -643,6 +697,8 @@ def build_leaderboard_embed(count_data):
         embed.set_footer(text=f"All-time record: {count_data['best_streak']} (by {count_data['best_streak_holder']})")
     return embed
 
+# A "View" is Discord's term for a message with clickable buttons attached.
+# This one adds the red "Reset Leaderboard" button under !countboard's embed.
 class LeaderboardView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=120)
@@ -718,6 +774,8 @@ async def commands_list(ctx):
     await ctx.send(embed=embed)
 
 # === Error Handling ===
+# Catches common command mistakes and replies with a friendly message instead
+# of letting the bot crash or silently do nothing.
 @bot.event
 async def on_command_error(ctx, error):
     if isinstance(error, commands.MissingPermissions):
@@ -732,5 +790,7 @@ async def on_command_error(ctx, error):
         raise error
 
 # === Run Bot ===
+# Create the database tables (if they don't exist yet), then connect to Discord.
+# This is the very last thing that runs — everything above is just definitions.
 init_db()
 bot.run(TOKEN)
