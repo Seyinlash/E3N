@@ -520,6 +520,13 @@ async def on_ready():
     # Fires once the bot has fully connected to Discord. This is also where
     # we register all the slash ("/") commands so they show up in Discord's UI.
     print(f"Bot online as {bot.user}")
+
+    # Render sets RENDER_EXTERNAL_URL automatically for every deployed service —
+    # printing it here makes Render's log viewer turn it into a clickable link,
+    # same as it does for its own "Available at your primary URL" line.
+    site_url = os.getenv("RENDER_EXTERNAL_URL", "https://e3n.onrender.com")
+    print(f"📊 Dashboard: {site_url}/dashboard")
+
     try:
         # Guild sync FIRST (instant) — copies the currently-registered commands
         # into every server the bot is in, while they're still in the tree
