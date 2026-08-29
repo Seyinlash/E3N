@@ -71,7 +71,10 @@ DASHBOARD_PAGE = """
   a.logout { color:#f23f42; text-decoration:none; font-size:14px; }
   .grid { display:grid; grid-template-columns:repeat(auto-fit, minmax(280px, 1fr)); gap:16px; margin-bottom:16px; }
   .card { background:#2b2d31; border-radius:10px; padding:18px; }
-  .card h2 { font-size:16px; margin:0 0 12px 0; color:#b5bac1; }
+  .card h2 { font-size:16px; margin:0; color:#b5bac1; }
+  .card-header { display:flex; justify-content:space-between; align-items:center; margin-bottom:12px; }
+  .card-header select { background:#1e1f22; color:#e3e5e8; border:1px solid #3a3c41; border-radius:6px;
+                         padding:4px 8px; font-size:13px; cursor:pointer; }
   table { width:100%; border-collapse:collapse; font-size:14px; }
   th, td { text-align:left; padding:6px 4px; border-bottom:1px solid #3a3c41; }
   th { color:#949ba4; font-weight:600; }
@@ -102,13 +105,27 @@ DASHBOARD_PAGE = """
 
   <div class="grid">
     <div class="card">
-      <h2>Counting Leaderboard</h2>
-      <table>
+      <div class="card-header">
+        <h2>Counting Leaderboard</h2>
+        <select id="leaderboardSelect" onchange="switchBoard()">
+          <option value="count">🔢 Top Counters</option>
+          <option value="ruined">💀 Count Ruiners</option>
+        </select>
+      </div>
+      <table id="countTable">
         <tr><th>#</th><th>Name</th><th>Correct</th><th>Ruined</th></tr>
         {% for u in leaderboard %}
         <tr><td>{{ loop.index }}</td><td>{{ u.display_name }}</td><td>{{ u.total_correct }}</td><td>{{ u.times_ruined }}</td></tr>
         {% else %}
         <tr><td colspan="4">No data yet.</td></tr>
+        {% endfor %}
+      </table>
+      <table id="ruinedTable" style="display:none;">
+        <tr><th>#</th><th>Name</th><th>Ruined</th><th>Correct</th></tr>
+        {% for u in ruined_leaderboard %}
+        <tr><td>{{ loop.index }}</td><td>{{ u.display_name }}</td><td>{{ u.times_ruined }}</td><td>{{ u.total_correct }}</td></tr>
+        {% else %}
+        <tr><td colspan="4">Nobody's ruined the count yet!</td></tr>
         {% endfor %}
       </table>
     </div>
@@ -124,6 +141,14 @@ DASHBOARD_PAGE = """
       </table>
     </div>
   </div>
+
+  <script>
+    function switchBoard() {
+      const val = document.getElementById('leaderboardSelect').value;
+      document.getElementById('countTable').style.display = val === 'count' ? 'table' : 'none';
+      document.getElementById('ruinedTable').style.display = val === 'ruined' ? 'table' : 'none';
+    }
+  </script>
 </body></html>
 """
 
@@ -161,13 +186,18 @@ def dashboard():
     members_data = load_data()
     month = get_current_month_key()
     count_data = load_count_data()
-    leaderboard = sorted(count_data.get("users", {}).values(), key=lambda u: u["total_correct"], reverse=True)[:10]
+    all_users = count_data.get("users", {}).values()
+    leaderboard = sorted(all_users, key=lambda u: u["total_correct"], reverse=True)[:10]
+    ruined_leaderboard = sorted(
+        (u for u in all_users if u["times_ruined"] > 0),
+        key=lambda u: u["times_ruined"], reverse=True
+    )[:10]
 
     return render_template_string(
         DASHBOARD_PAGE,
         bot_online=bot_online, bot_user=bot_user, guild_count=guild_count,
         members_data=members_data, month=month,
-        count_data=count_data, leaderboard=leaderboard
+        count_data=count_data, leaderboard=leaderboard, ruined_leaderboard=ruined_leaderboard
     )
 
 def run():
@@ -829,29 +859,58 @@ async def counting(ctx, state: str):
     else:
         await ctx.send("🛑 Counting game turned **off**. Leaderboard and progress are kept.")
 
-# --- Leaderboard display + its reset button ---
-def build_leaderboard_embed(count_data):
-    # Builds the top-10 leaderboard embed. Pulled into its own function since
-    # both !countboard and the reset button below need to redraw this same embed.
+# --- Leaderboard display + its toggle/reset buttons ---
+def build_leaderboard_embed(count_data, mode="correct"):
+    # Builds either the "correct counts" or "times ruined" leaderboard embed,
+    # depending on `mode`. Used by !countboard and its buttons below.
     users = count_data.get("users", {})
-    ranked = sorted(users.values(), key=lambda u: u["total_correct"], reverse=True)
-    lines = [f"{i+1}. {u['display_name']} — {u['total_correct']} correct, {u['times_ruined']} ruined"
-              for i, u in enumerate(ranked[:10])] if ranked else ["No counting data yet."]
 
-    embed = discord.Embed(
-        title="🔢 Counting Leaderboard",
-        description="\n".join(lines),
-        color=discord.Color.gold()
-    )
+    if mode == "ruined":
+        ranked = sorted(
+            (u for u in users.values() if u["times_ruined"] > 0),
+            key=lambda u: u["times_ruined"],
+            reverse=True
+        )
+        lines = [f"{i+1}. {u['display_name']} — {u['times_ruined']} ruined, {u['total_correct']} correct"
+                  for i, u in enumerate(ranked[:10])] if ranked else ["Nobody's ruined the count yet — clean streak!"]
+        embed = discord.Embed(
+            title="💀 Count Ruiners Leaderboard",
+            description="\n".join(lines),
+            color=discord.Color.red()
+        )
+    else:
+        ranked = sorted(users.values(), key=lambda u: u["total_correct"], reverse=True)
+        lines = [f"{i+1}. {u['display_name']} — {u['total_correct']} correct, {u['times_ruined']} ruined"
+                  for i, u in enumerate(ranked[:10])] if ranked else ["No counting data yet."]
+        embed = discord.Embed(
+            title="🔢 Counting Leaderboard",
+            description="\n".join(lines),
+            color=discord.Color.gold()
+        )
+
     if count_data.get("best_streak_holder"):
         embed.set_footer(text=f"All-time record: {count_data['best_streak']} (by {count_data['best_streak_holder']})")
     return embed
 
 # A "View" is Discord's term for a message with clickable buttons attached.
-# This one adds the red "Reset Leaderboard" button under !countboard's embed.
+# This one lets people switch between the "Correct" and "Ruined" leaderboards,
+# plus an admin-only "Reset" button — all on the same message.
 class LeaderboardView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=120)
+        self.mode = "correct"
+
+    @discord.ui.button(label="Correct", style=discord.ButtonStyle.primary, emoji="🔢")
+    async def show_correct(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.mode = "correct"
+        count_data = load_count_data()
+        await interaction.response.edit_message(embed=build_leaderboard_embed(count_data, "correct"), view=self)
+
+    @discord.ui.button(label="Ruined", style=discord.ButtonStyle.secondary, emoji="💀")
+    async def show_ruined(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.mode = "ruined"
+        count_data = load_count_data()
+        await interaction.response.edit_message(embed=build_leaderboard_embed(count_data, "ruined"), view=self)
 
     @discord.ui.button(label="Reset Leaderboard", style=discord.ButtonStyle.danger, emoji="🗑️")
     async def reset_leaderboard(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -867,37 +926,16 @@ class LeaderboardView(discord.ui.View):
 
         button.disabled = True
         button.label = "Leaderboard Reset"
-        await interaction.response.edit_message(embed=build_leaderboard_embed(count_data), view=self)
+        await interaction.response.edit_message(embed=build_leaderboard_embed(count_data, self.mode), view=self)
 
     async def on_timeout(self):
         for item in self.children:
             item.disabled = True
 
-@bot.hybrid_command(description="Show the counting game leaderboard")
+@bot.hybrid_command(description="Show the counting game leaderboard (correct counts or ruined counts)")
 async def countboard(ctx):
     count_data = load_count_data()
-    await ctx.send(embed=build_leaderboard_embed(count_data), view=LeaderboardView())
-
-@bot.hybrid_command(description="Show who's broken the count the most")
-async def ruinedboard(ctx):
-    count_data = load_count_data()
-    users = count_data.get("users", {})
-
-    # Only show people who've actually ruined the count at least once
-    ranked = sorted(
-        (u for u in users.values() if u["times_ruined"] > 0),
-        key=lambda u: u["times_ruined"],
-        reverse=True
-    )
-    lines = [f"{i+1}. {u['display_name']} — {u['times_ruined']} ruined, {u['total_correct']} correct"
-              for i, u in enumerate(ranked[:10])] if ranked else ["Nobody's ruined the count yet — clean streak!"]
-
-    embed = discord.Embed(
-        title="💀 Count Ruiners Leaderboard",
-        description="\n".join(lines),
-        color=discord.Color.red()
-    )
-    await ctx.send(embed=embed)
+    await ctx.send(embed=build_leaderboard_embed(count_data, "correct"), view=LeaderboardView())
 
 @bot.hybrid_command(name="commands", description="Show everything E3N can do")
 async def commands_list(ctx):
@@ -911,8 +949,7 @@ async def commands_list(ctx):
         value=(
             "`!strikes` — Show everyone's strike totals\n"
             "`!logs` — Show this month's hosting + strike totals\n"
-            "`!countboard` — Show the counting game leaderboard\n"
-            "`!ruinedboard` — Show who's broken the count the most\n"
+            "`!countboard` — Show the counting leaderboard (toggle Correct/Ruined)\n"
             "`!userinfo [@member]` — Show info about a member (defaults to you)\n"
             "`!roleinfo @role` — Show info about a role\n"
             "`!commands` — Show this message"
