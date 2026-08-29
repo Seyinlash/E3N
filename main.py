@@ -878,6 +878,27 @@ async def countboard(ctx):
     count_data = load_count_data()
     await ctx.send(embed=build_leaderboard_embed(count_data), view=LeaderboardView())
 
+@bot.hybrid_command(description="Show who's broken the count the most")
+async def ruinedboard(ctx):
+    count_data = load_count_data()
+    users = count_data.get("users", {})
+
+    # Only show people who've actually ruined the count at least once
+    ranked = sorted(
+        (u for u in users.values() if u["times_ruined"] > 0),
+        key=lambda u: u["times_ruined"],
+        reverse=True
+    )
+    lines = [f"{i+1}. {u['display_name']} — {u['times_ruined']} ruined, {u['total_correct']} correct"
+              for i, u in enumerate(ranked[:10])] if ranked else ["Nobody's ruined the count yet — clean streak!"]
+
+    embed = discord.Embed(
+        title="💀 Count Ruiners Leaderboard",
+        description="\n".join(lines),
+        color=discord.Color.red()
+    )
+    await ctx.send(embed=embed)
+
 @bot.hybrid_command(name="commands", description="Show everything E3N can do")
 async def commands_list(ctx):
     embed = discord.Embed(
@@ -891,6 +912,7 @@ async def commands_list(ctx):
             "`!strikes` — Show everyone's strike totals\n"
             "`!logs` — Show this month's hosting + strike totals\n"
             "`!countboard` — Show the counting game leaderboard\n"
+            "`!ruinedboard` — Show who's broken the count the most\n"
             "`!userinfo [@member]` — Show info about a member (defaults to you)\n"
             "`!roleinfo @role` — Show info about a role\n"
             "`!commands` — Show this message"
