@@ -1,12 +1,13 @@
 from flask import Flask, request, session, redirect, url_for, render_template_string
 from threading import Thread
 import discord
-from discord.ext import commands
+from discord.ext import commands, tasks
 import os
 import json
 import sys
 import re
 import ast
+import time
 import asyncio
 import operator
 import secrets
@@ -21,52 +22,43 @@ import random
 # Force unbuffered stdout so Render logs show print() output immediately, in order
 sys.stdout.reconfigure(line_buffering=True)
 
-# === Keep-Alive Server + Dashboard ===
+# === Keep-Alive Server + Web Dashboard ===
 app = Flask('')
-# Random each time the bot restarts — this just signs the login cookie, it
-# doesn't need to be remembered, but it does mean everyone gets logged out
-# of the dashboard whenever the bot redeploys/restarts.
-app.secret_key = secrets.token_hex(32)
-
-DASHBOARD_PASSWORD = os.getenv("DASHBOARD_PASSWORD")
+app.secret_key = os.getenv("FLASK_SECRET_KEY") or secrets.token_hex(32)
 
 @app.route('/')
 def home():
     return "Bot is running."
 
 LOGIN_PAGE = """
-<!DOCTYPE html>
-<html><head><title>E3N Dashboard - Login</title>
+<!DOCTYPE html><html><head><title>E3N Login</title>
 <style>
-  body { background:#1e1f22; color:#e3e5e8; font-family:-apple-system,sans-serif;
-         display:flex; align-items:center; justify-content:center; height:100vh; margin:0; }
-  .box { background:#2b2d31; padding:32px; border-radius:12px; width:280px; text-align:center; }
-  h1 { font-size:20px; margin-bottom:20px; }
-  input { width:100%; padding:10px; border-radius:6px; border:none; margin-bottom:12px;
+  body { background:#1e1f22; color:#e3e5e8; font-family:sans-serif; display:flex;
+         align-items:center; justify-content:center; height:100vh; margin:0; }
+  .box { background:#2b2d31; padding:32px; border-radius:10px; width:280px; text-align:center; }
+  input { width:100%; padding:10px; margin-top:12px; border-radius:6px; border:none;
           background:#1e1f22; color:#e3e5e8; box-sizing:border-box; }
-  button { width:100%; padding:10px; border-radius:6px; border:none; background:#5865f2;
-           color:white; font-weight:600; cursor:pointer; }
-  button:hover { background:#4752c4; }
-  .error { color:#f23f42; margin-bottom:12px; font-size:14px; }
+  button { width:100%; padding:10px; margin-top:14px; border-radius:6px; border:none;
+           background:#5865F2; color:white; font-weight:600; cursor:pointer; }
+  .error { color:#f23f42; font-size:13px; margin-top:10px; }
 </style></head>
 <body>
   <div class="box">
-    <h1>🤖 E3N Dashboard</h1>
-    {% if error %}<div class="error">{{ error }}</div>{% endif %}
+    <h2>🤖 E3N Dashboard</h2>
     <form method="POST">
       <input type="password" name="password" placeholder="Password" autofocus>
       <button type="submit">Log In</button>
     </form>
+    {% if error %}<div class="error">{{ error }}</div>{% endif %}
   </div>
 </body></html>
 """
 
 DASHBOARD_PAGE = """
-<!DOCTYPE html>
-<html><head><title>E3N Dashboard</title>
+<!DOCTYPE html><html><head><title>E3N Dashboard</title>
 <style>
-  body { background:#1e1f22; color:#e3e5e8; font-family:-apple-system,sans-serif; margin:0; padding:24px; }
-  .header { display:flex; justify-content:space-between; align-items:center; margin-bottom:24px; }
+  body { background:#1e1f22; color:#e3e5e8; font-family:sans-serif; margin:0; padding:24px; }
+  .header { display:flex; justify-content:space-between; align-items:center; margin-bottom:20px; }
   h1 { font-size:22px; margin:0; }
   a.logout { color:#f23f42; text-decoration:none; font-size:14px; }
   .grid { display:grid; grid-template-columns:repeat(auto-fit, minmax(280px, 1fr)); gap:16px; margin-bottom:16px; }
@@ -84,22 +76,35 @@ DASHBOARD_PAGE = """
 <body>
   <div class="header">
     <h1>🤖 E3N Dashboard</h1>
-    <a class="logout" href="{{ url_for('logout') }}">Log out</a>
+    <a class="logout" href="/logout">Log out</a>
   </div>
 
   <div class="grid">
     <div class="card">
       <h2>Bot Status</h2>
-      <p>Status: <span class="{{ 'online' if bot_online else 'offline' }}">{{ 'Online' if bot_online else 'Offline' }}</span></p>
-      <p>Logged in as: {{ bot_user }}</p>
-      <p>Servers: {{ guild_count }}</p>
+      <table>
+        <tr><td>Status</td><td>{% if bot_online %}<span class="online">🟢 Online</span>{% else %}<span class="offline">🔴 Offline</span>{% endif %}</td></tr>
+        <tr><td>Logged in as</td><td>{{ bot_user }}</td></tr>
+        <tr><td>Servers</td><td>{{ guild_count }}</td></tr>
+      </table>
     </div>
     <div class="card">
       <h2>Counting Game</h2>
-      <p>Current count: <strong>{{ count_data.current_count }}</strong></p>
-      <p>Channel set: {{ 'Yes' if count_data.channel_id else 'No' }}</p>
-      <p>Enabled: {{ 'Yes' if count_data.enabled else 'No' }}</p>
-      <p>All-time record: {{ count_data.best_streak }}{% if count_data.best_streak_holder %} (by {{ count_data.best_streak_holder }}){% endif %}</p>
+      <table>
+        <tr><td>Current count</td><td>{{ count_data.current_count }}</td></tr>
+        <tr><td>Status</td><td>{{ "🟢 On" if count_data.enabled else "🔴 Off" }}</td></tr>
+        <tr><td>All-time record</td><td>{{ count_data.best_streak }}{% if count_data.best_streak_holder %} (by {{ count_data.best_streak_holder }}){% endif %}</td></tr>
+      </table>
+    </div>
+    <div class="card">
+      <h2>Supabase Stats</h2>
+      <table>
+        <tr><td>Connection</td><td>{% if db_stats.connected %}<span class="online">🟢 Connected</span>{% else %}<span class="offline">🔴 Disconnected</span>{% endif %}</td></tr>
+        <tr><td>Query latency</td><td>{{ db_stats.latency_ms }} ms</td></tr>
+        <tr><td>Database size</td><td>{{ db_stats.db_size }}</td></tr>
+        <tr><td>Members tracked</td><td>{{ db_stats.members_count }}</td></tr>
+        <tr><td>Counters tracked</td><td>{{ db_stats.counters_count }}</td></tr>
+      </table>
     </div>
   </div>
 
@@ -154,20 +159,21 @@ DASHBOARD_PAGE = """
 
 @app.route('/login', methods=['GET', 'POST'])
 def login():
-    if not DASHBOARD_PASSWORD:
-        return "⚠️ DASHBOARD_PASSWORD isn't set in Render's environment variables yet.", 503
-
     error = None
     if request.method == 'POST':
-        if request.form.get('password') == DASHBOARD_PASSWORD:
+        expected = os.getenv("DASHBOARD_PASSWORD")
+        if not expected:
+            error = "DASHBOARD_PASSWORD isn't set on the server yet."
+        elif request.form.get('password') == expected:
             session['authenticated'] = True
             return redirect(url_for('dashboard'))
-        error = "Incorrect password."
+        else:
+            error = "Wrong password."
     return render_template_string(LOGIN_PAGE, error=error)
 
 @app.route('/logout')
 def logout():
-    session.pop('authenticated', None)
+    session.clear()
     return redirect(url_for('login'))
 
 @app.route('/dashboard')
@@ -175,10 +181,10 @@ def dashboard():
     if not session.get('authenticated'):
         return redirect(url_for('login'))
 
-    # `bot`, `load_data`, `load_count_data`, and `get_current_month_key` are all
-    # defined further down in this file — that's fine, Python only looks them up
-    # when this function actually runs (i.e. when someone visits the page),
-    # by which point the whole file has already finished loading.
+    # `bot`, `load_data`, `load_count_data`, `get_current_month_key`, and
+    # `get_db_stats` are all defined further down in this file — that's fine,
+    # Python only looks them up when this function actually runs (i.e. when
+    # someone visits the page), by which point the whole file has loaded.
     bot_online = bot.is_ready()
     bot_user = str(bot.user) if bot.user else "Not connected yet"
     guild_count = len(bot.guilds) if bot.is_ready() else 0
@@ -192,12 +198,14 @@ def dashboard():
         (u for u in all_users if u["times_ruined"] > 0),
         key=lambda u: u["times_ruined"], reverse=True
     )[:10]
+    db_stats = get_db_stats()
 
     return render_template_string(
         DASHBOARD_PAGE,
         bot_online=bot_online, bot_user=bot_user, guild_count=guild_count,
         members_data=members_data, month=month,
-        count_data=count_data, leaderboard=leaderboard, ruined_leaderboard=ruined_leaderboard
+        count_data=count_data, leaderboard=leaderboard, ruined_leaderboard=ruined_leaderboard,
+        db_stats=db_stats
     )
 
 def run():
@@ -282,15 +290,22 @@ def init_db():
                 times_ruined INT DEFAULT 0
             )
         """)
-        # General bot settings — right now just the command-log channel.
-        # Also a single-row table like counting_config above.
+        # General bot settings — single-row table like counting_config above.
+        # monthly_report_channel_id / last_monthly_reset power the monthly
+        # report + reset feature further down.
         cur.execute("""
             CREATE TABLE IF NOT EXISTS bot_settings (
                 id INT PRIMARY KEY DEFAULT 1,
-                log_channel_id BIGINT
+                log_channel_id BIGINT,
+                monthly_report_channel_id BIGINT,
+                last_monthly_reset TEXT
             )
         """)
         cur.execute("INSERT INTO bot_settings (id) VALUES (1) ON CONFLICT (id) DO NOTHING")
+        # Safe to run even on a table that already existed before these
+        # columns were added — won't touch anything if they're already there.
+        cur.execute("ALTER TABLE bot_settings ADD COLUMN IF NOT EXISTS monthly_report_channel_id BIGINT")
+        cur.execute("ALTER TABLE bot_settings ADD COLUMN IF NOT EXISTS last_monthly_reset TEXT")
         conn.commit()
         cur.close()
         conn.close()
@@ -298,6 +313,33 @@ def init_db():
     except Exception as e:
         print(f"⚠️ Failed to initialize database: {e}")
         traceback.print_exc()
+
+def get_db_stats():
+    # Powers the "Supabase Stats" dashboard card — measures how long a quick
+    # round-trip query takes, plus overall database size and row counts.
+    try:
+        start = time.monotonic()
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute("SELECT pg_size_pretty(pg_database_size(current_database()))")
+        db_size = cur.fetchone()[0]
+        cur.execute("SELECT count(*) FROM members")
+        members_count = cur.fetchone()[0]
+        cur.execute("SELECT count(*) FROM counting_users")
+        counters_count = cur.fetchone()[0]
+        cur.close()
+        conn.close()
+        latency_ms = round((time.monotonic() - start) * 1000)
+        return {
+            "connected": True,
+            "db_size": db_size,
+            "members_count": members_count,
+            "counters_count": counters_count,
+            "latency_ms": latency_ms,
+        }
+    except Exception as e:
+        print(f"⚠️ Failed to fetch DB stats: {e}")
+        return {"connected": False, "db_size": "—", "members_count": 0, "counters_count": 0, "latency_ms": None}
 
 # === Strikes/Hosting Storage (members table) ===
 def load_data():
@@ -498,8 +540,8 @@ def parse_count_attempt(content):
 
 # === Bot Settings Storage (bot_settings table) ===
 def load_bot_settings():
-    # Right now this only holds the command-log channel, but it's built to
-    # easily hold more server-wide settings later if you want to add them.
+    # Holds the command-log channel, the monthly-report channel, and which
+    # month was last processed by the monthly reset (so it never double-fires).
     try:
         conn = get_db()
         cur = conn.cursor(cursor_factory=RealDictCursor)
@@ -507,19 +549,25 @@ def load_bot_settings():
         row = cur.fetchone()
         cur.close()
         conn.close()
-        return {"log_channel_id": row["log_channel_id"] if row else None}
+        if not row:
+            return {"log_channel_id": None, "monthly_report_channel_id": None, "last_monthly_reset": None}
+        return {
+            "log_channel_id": row.get("log_channel_id"),
+            "monthly_report_channel_id": row.get("monthly_report_channel_id"),
+            "last_monthly_reset": row.get("last_monthly_reset"),
+        }
     except Exception as e:
         print(f"⚠️ Failed to load bot settings: {e}")
         traceback.print_exc()
-        return {"log_channel_id": None}
+        return {"log_channel_id": None, "monthly_report_channel_id": None, "last_monthly_reset": None}
 
 def save_bot_settings(settings):
     try:
         conn = get_db()
         cur = conn.cursor()
         cur.execute(
-            "UPDATE bot_settings SET log_channel_id = %s WHERE id = 1",
-            (settings.get("log_channel_id"),)
+            "UPDATE bot_settings SET log_channel_id = %s, monthly_report_channel_id = %s, last_monthly_reset = %s WHERE id = 1",
+            (settings.get("log_channel_id"), settings.get("monthly_report_channel_id"), settings.get("last_monthly_reset"))
         )
         conn.commit()
         cur.close()
@@ -544,6 +592,95 @@ def ensure_count_user(data, member: discord.Member):
         data["users"][uid]["display_name"] = member.display_name
     return uid
 
+# === Monthly Report + Reset ===
+def build_monthly_report_embed(members_data, month_key):
+    # Builds the "closing the books" summary embed for a given month
+    # (e.g. "2026-08") — used by both the automatic and manual report.
+    try:
+        month_label = datetime.strptime(month_key, "%Y-%m").strftime("%B %Y")
+    except ValueError:
+        month_label = month_key
+
+    if not members_data:
+        description = "No activity recorded this month."
+    else:
+        host_lines = []
+        strike_lines = []
+        for record in sorted(members_data.values(), key=lambda x: x.get("display_name", "")):
+            name = record["display_name"]
+            hosted = record.get("monthly", {}).get(month_key, 0)
+            strikes = record.get("strikes", 0)
+            host_lines.append(f"{name}: {hosted}")
+            strike_lines.append(f"{name}: {strikes}")
+
+        if all(line.endswith(": 0") for line in host_lines + strike_lines):
+            description = "No activity recorded this month."
+        else:
+            description = (
+                "**Hosting:**\n" + "\n".join(host_lines) +
+                "\n\n**Strikes:**\n" + "\n".join(strike_lines)
+            )
+
+    return discord.Embed(
+        title=f"🧾 {month_label} Report",
+        description=description,
+        color=discord.Color.blurple()
+    )
+
+async def run_monthly_reset(month_key, channel):
+    # Posts the report for `month_key`, then wipes everyone's strikes and
+    # hosting numbers back to zero — a full "close the books" for the month.
+    # Returns True/False so the caller can tell the user what happened.
+    data = load_data()
+    embed = build_monthly_report_embed(data, month_key)
+    try:
+        await channel.send(embed=embed)
+    except discord.HTTPException as e:
+        print(f"⚠️ Failed to send monthly report: {e}")
+        return False
+
+    for rec in data.values():
+        rec["strikes"] = 0
+        rec["monthly"] = {}
+
+    if not save_data(data):
+        return False
+
+    settings = load_bot_settings()
+    settings["last_monthly_reset"] = month_key
+    save_bot_settings(settings)
+    return True
+
+@tasks.loop(hours=24)
+async def monthly_report_task():
+    # Checks once a day; only actually does anything on the 1st of the month,
+    # and only once per month even if the bot restarts multiple times that day.
+    now = datetime.utcnow()
+    if now.day != 1:
+        return
+
+    settings = load_bot_settings()
+    channel_id = settings.get("monthly_report_channel_id")
+    if not channel_id:
+        return
+
+    prev_month_date = now.replace(day=1) - timedelta(days=1)
+    prev_month_key = prev_month_date.strftime("%Y-%m")
+    if settings.get("last_monthly_reset") == prev_month_key:
+        return  # already handled this month
+
+    channel = bot.get_channel(channel_id)
+    if not channel:
+        print("⚠️ Monthly report channel not found — run !channelsettings to set it again.")
+        return
+
+    print(f"📅 Running automatic monthly reset for {prev_month_key}")
+    await run_monthly_reset(prev_month_key, channel)
+
+@monthly_report_task.before_loop
+async def before_monthly_report_task():
+    await bot.wait_until_ready()
+
 # === Events ===
 @bot.event
 async def on_ready():
@@ -556,6 +693,9 @@ async def on_ready():
     # same as it does for its own "Available at your primary URL" line.
     site_url = os.getenv("RENDER_EXTERNAL_URL", "https://e3n.onrender.com")
     print(f"📊 Dashboard: {site_url}/dashboard")
+
+    if not monthly_report_task.is_running():
+        monthly_report_task.start()
 
     try:
         # Guild sync FIRST (instant) — copies the currently-registered commands
@@ -575,7 +715,7 @@ async def on_ready():
 @bot.after_invoke
 async def log_command_usage(ctx):
     # Runs automatically after EVERY command finishes (any command, from
-    # anyone) — posts a short summary to the log channel set with !setlogchannel.
+    # anyone) — posts a short summary to the log channel set in !channelsettings.
     # If no log channel has been set, this just quietly does nothing.
     try:
         settings = load_bot_settings()
@@ -810,32 +950,109 @@ async def roleinfo(ctx, role: discord.Role):
     await ctx.send(embed=embed)
 
 # --- Admin/owner settings commands ---
-@bot.hybrid_command(description="Set the channel where all command usage gets logged (server owner only)")
-@discord.app_commands.describe(channel="The channel to send the command usage log to")
-async def setlogchannel(ctx, channel: discord.TextChannel):
+@bot.hybrid_command(description="Set up all the bot's channels in one guided walkthrough (server owner only)")
+async def channelsettings(ctx):
+    if ctx.guild is None or ctx.author.id != ctx.guild.owner_id:
+        await ctx.send("🚫 Only the server owner can use this command.")
+        return
+
+    def check(m):
+        return m.author.id == ctx.author.id and m.channel.id == ctx.channel.id
+
+    await ctx.send(
+        "⚙️ **Channel Setup** — I'll ask about a few channels, one at a time.\n"
+        "Mention a channel (like #general) to set it, type `skip` to leave it as-is, "
+        "or `cancel` anytime to stop."
+    )
+
+    questions = [
+        ("log_channel_id", "1️⃣ Where should **command usage logs** be sent?"),
+        ("count_channel_id", "2️⃣ Which channel should the **counting game** use? *(Setting this resets the current count to 0.)*"),
+        ("monthly_report_channel_id", "3️⃣ Where should **monthly hosting/strike reports** be sent?"),
+    ]
+
+    results = {}
+    for key, question in questions:
+        await ctx.send(question)
+        while True:
+            try:
+                reply = await bot.wait_for("message", check=check, timeout=60)
+            except asyncio.TimeoutError:
+                await ctx.send("⏳ Setup timed out. Run `!channelsettings` again anytime.")
+                return
+
+            text = reply.content.strip().lower()
+            if text == "cancel":
+                await ctx.send("❌ Setup cancelled. Nothing was changed.")
+                return
+            if text == "skip":
+                results[key] = None  # None means "leave unchanged"
+                break
+            if reply.channel_mentions:
+                results[key] = reply.channel_mentions[0].id
+                break
+            await ctx.send("❌ That doesn't look like a channel mention. Try again, or type `skip`.")
+
+    settings = load_bot_settings()
+    count_data = load_count_data()
+    summary_lines = []
+
+    if results["log_channel_id"] is not None:
+        settings["log_channel_id"] = results["log_channel_id"]
+        summary_lines.append(f"📝 Command logs → <#{results['log_channel_id']}>")
+    else:
+        summary_lines.append("📝 Command logs → unchanged")
+
+    if results["count_channel_id"] is not None:
+        count_data["channel_id"] = results["count_channel_id"]
+        count_data["current_count"] = 0
+        count_data["last_user_id"] = None
+        summary_lines.append(f"🔢 Counting game → <#{results['count_channel_id']}> (count reset to 0)")
+    else:
+        summary_lines.append("🔢 Counting game → unchanged")
+
+    if results["monthly_report_channel_id"] is not None:
+        settings["monthly_report_channel_id"] = results["monthly_report_channel_id"]
+        summary_lines.append(f"🧾 Monthly reports → <#{results['monthly_report_channel_id']}>")
+    else:
+        summary_lines.append("🧾 Monthly reports → unchanged")
+
+    ok1 = save_bot_settings(settings)
+    ok2 = save_count_data(count_data)
+    if not (ok1 and ok2):
+        await ctx.send("❌ Database error while saving one or more settings. Check Render logs.")
+        return
+
+    embed = discord.Embed(
+        title="✅ Channel Setup Complete",
+        description="\n".join(summary_lines),
+        color=discord.Color.green()
+    )
+    await ctx.send(embed=embed)
+
+@bot.hybrid_command(description="Post + reset this month's hosting and strikes right now (server owner only)")
+async def exportmonth(ctx):
     if ctx.guild is None or ctx.author.id != ctx.guild.owner_id:
         await ctx.send("🚫 Only the server owner can use this command.")
         return
 
     settings = load_bot_settings()
-    settings["log_channel_id"] = channel.id
-    if not save_bot_settings(settings):
-        await ctx.send("❌ Database error — the log channel wasn't saved. Check Render logs.")
+    channel_id = settings.get("monthly_report_channel_id")
+    if not channel_id:
+        await ctx.send("❌ No monthly report channel is set yet. Run `!channelsettings` first.")
         return
-    await ctx.send(f"📝 Command usage will now be logged to {channel.mention}.")
+    channel = bot.get_channel(channel_id)
+    if not channel:
+        await ctx.send("❌ Couldn't find that channel anymore. Run `!channelsettings` to set it again.")
+        return
 
-@bot.hybrid_command(description="Set the channel used for the counting game")
-@discord.app_commands.describe(channel="The channel to use for counting")
-@commands.has_permissions(administrator=True)
-async def setcountchannel(ctx, channel: discord.TextChannel):
-    count_data = load_count_data()
-    count_data["channel_id"] = channel.id
-    count_data["current_count"] = 0
-    count_data["last_user_id"] = None
-    if not save_count_data(count_data):
-        await ctx.send("❌ Database error — the channel wasn't saved. Check Render logs.")
-        return
-    await ctx.send(f"🔢 Counting channel set to {channel.mention}. Next number is **1**.")
+    month_key = get_current_month_key()
+    await ctx.send(f"⏳ Posting this month's report to {channel.mention} and resetting hosting + strikes...")
+    success = await run_monthly_reset(month_key, channel)
+    if success:
+        await ctx.send(f"✅ Done — report posted to {channel.mention}, hosting and strikes reset for everyone.")
+    else:
+        await ctx.send("❌ Something went wrong. Check Render logs.")
 
 @bot.hybrid_command(description="Turn the counting game on or off")
 @discord.app_commands.describe(state="Turn counting on or off")
@@ -859,58 +1076,29 @@ async def counting(ctx, state: str):
     else:
         await ctx.send("🛑 Counting game turned **off**. Leaderboard and progress are kept.")
 
-# --- Leaderboard display + its toggle/reset buttons ---
-def build_leaderboard_embed(count_data, mode="correct"):
-    # Builds either the "correct counts" or "times ruined" leaderboard embed,
-    # depending on `mode`. Used by !countboard and its buttons below.
+# --- Leaderboard display + its reset button ---
+def build_leaderboard_embed(count_data):
+    # Builds the top-10 leaderboard embed. Pulled into its own function since
+    # both !countboard and the reset button below need to redraw this same embed.
     users = count_data.get("users", {})
+    ranked = sorted(users.values(), key=lambda u: u["total_correct"], reverse=True)
+    lines = [f"{i+1}. {u['display_name']} — {u['total_correct']} correct, {u['times_ruined']} ruined"
+              for i, u in enumerate(ranked[:10])] if ranked else ["No counting data yet."]
 
-    if mode == "ruined":
-        ranked = sorted(
-            (u for u in users.values() if u["times_ruined"] > 0),
-            key=lambda u: u["times_ruined"],
-            reverse=True
-        )
-        lines = [f"{i+1}. {u['display_name']} — {u['times_ruined']} ruined, {u['total_correct']} correct"
-                  for i, u in enumerate(ranked[:10])] if ranked else ["Nobody's ruined the count yet — clean streak!"]
-        embed = discord.Embed(
-            title="💀 Count Ruiners Leaderboard",
-            description="\n".join(lines),
-            color=discord.Color.red()
-        )
-    else:
-        ranked = sorted(users.values(), key=lambda u: u["total_correct"], reverse=True)
-        lines = [f"{i+1}. {u['display_name']} — {u['total_correct']} correct, {u['times_ruined']} ruined"
-                  for i, u in enumerate(ranked[:10])] if ranked else ["No counting data yet."]
-        embed = discord.Embed(
-            title="🔢 Counting Leaderboard",
-            description="\n".join(lines),
-            color=discord.Color.gold()
-        )
-
+    embed = discord.Embed(
+        title="🔢 Counting Leaderboard",
+        description="\n".join(lines),
+        color=discord.Color.gold()
+    )
     if count_data.get("best_streak_holder"):
         embed.set_footer(text=f"All-time record: {count_data['best_streak']} (by {count_data['best_streak_holder']})")
     return embed
 
 # A "View" is Discord's term for a message with clickable buttons attached.
-# This one lets people switch between the "Correct" and "Ruined" leaderboards,
-# plus an admin-only "Reset" button — all on the same message.
+# This one adds the red "Reset Leaderboard" button under !countboard's embed.
 class LeaderboardView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=120)
-        self.mode = "correct"
-
-    @discord.ui.button(label="Correct", style=discord.ButtonStyle.primary, emoji="🔢")
-    async def show_correct(self, interaction: discord.Interaction, button: discord.ui.Button):
-        self.mode = "correct"
-        count_data = load_count_data()
-        await interaction.response.edit_message(embed=build_leaderboard_embed(count_data, "correct"), view=self)
-
-    @discord.ui.button(label="Ruined", style=discord.ButtonStyle.secondary, emoji="💀")
-    async def show_ruined(self, interaction: discord.Interaction, button: discord.ui.Button):
-        self.mode = "ruined"
-        count_data = load_count_data()
-        await interaction.response.edit_message(embed=build_leaderboard_embed(count_data, "ruined"), view=self)
 
     @discord.ui.button(label="Reset Leaderboard", style=discord.ButtonStyle.danger, emoji="🗑️")
     async def reset_leaderboard(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -926,16 +1114,37 @@ class LeaderboardView(discord.ui.View):
 
         button.disabled = True
         button.label = "Leaderboard Reset"
-        await interaction.response.edit_message(embed=build_leaderboard_embed(count_data, self.mode), view=self)
+        await interaction.response.edit_message(embed=build_leaderboard_embed(count_data), view=self)
 
     async def on_timeout(self):
         for item in self.children:
             item.disabled = True
 
-@bot.hybrid_command(description="Show the counting game leaderboard (correct counts or ruined counts)")
+@bot.hybrid_command(description="Show the counting game leaderboard")
 async def countboard(ctx):
     count_data = load_count_data()
-    await ctx.send(embed=build_leaderboard_embed(count_data, "correct"), view=LeaderboardView())
+    await ctx.send(embed=build_leaderboard_embed(count_data), view=LeaderboardView())
+
+@bot.hybrid_command(description="Show who's broken the count the most")
+async def ruinedboard(ctx):
+    count_data = load_count_data()
+    users = count_data.get("users", {})
+
+    # Only show people who've actually ruined the count at least once
+    ranked = sorted(
+        (u for u in users.values() if u["times_ruined"] > 0),
+        key=lambda u: u["times_ruined"],
+        reverse=True
+    )
+    lines = [f"{i+1}. {u['display_name']} — {u['times_ruined']} ruined, {u['total_correct']} correct"
+              for i, u in enumerate(ranked[:10])] if ranked else ["Nobody's ruined the count yet — clean streak!"]
+
+    embed = discord.Embed(
+        title="💀 Count Ruiners Leaderboard",
+        description="\n".join(lines),
+        color=discord.Color.red()
+    )
+    await ctx.send(embed=embed)
 
 @bot.hybrid_command(name="commands", description="Show everything E3N can do")
 async def commands_list(ctx):
@@ -949,7 +1158,8 @@ async def commands_list(ctx):
         value=(
             "`!strikes` — Show everyone's strike totals\n"
             "`!logs` — Show this month's hosting + strike totals\n"
-            "`!countboard` — Show the counting leaderboard (toggle Correct/Ruined)\n"
+            "`!countboard` — Show the counting game leaderboard\n"
+            "`!ruinedboard` — Show who's broken the count the most\n"
             "`!userinfo [@member]` — Show info about a member (defaults to you)\n"
             "`!roleinfo @role` — Show info about a role\n"
             "`!commands` — Show this message"
@@ -968,15 +1178,15 @@ async def commands_list(ctx):
     )
     embed.add_field(
         name="🛡️ Admin Only (requires Administrator)",
-        value=(
-            "`!setcountchannel #channel` — Set the channel used for the counting game\n"
-            "`!counting on/off` — Turn the counting game on or off"
-        ),
+        value="`!counting on/off` — Turn the counting game on or off",
         inline=False
     )
     embed.add_field(
         name="👑 Server Owner Only",
-        value="`!setlogchannel #channel` — Set the channel where all command usage gets logged",
+        value=(
+            "`!channelsettings` — Guided setup for all the bot's channels (log, counting, monthly reports)\n"
+            "`!exportmonth` — Post + reset this month's hosting and strikes right now"
+        ),
         inline=False
     )
     embed.set_footer(text="Works as ! commands or / slash commands")
