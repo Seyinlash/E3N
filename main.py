@@ -712,7 +712,7 @@ async def before_monthly_report():
 @bot.after_invoke
 async def log_command_usage(ctx):
     # Runs automatically after EVERY command finishes (any command, from
-    # anyone) — posts a short summary to the log channel set with !setlogchannel.
+    # anyone) — posts a short summary to the log channel set via !settings.
     # If no log channel has been set, this just quietly does nothing.
     try:
         settings = load_bot_settings()
@@ -961,69 +961,100 @@ async def roleinfo(ctx, role: discord.Role):
     embed.add_field(name="Created", value=discord.utils.format_dt(role.created_at, style="R"), inline=True)
     await ctx.send(embed=embed)
 
-# --- Admin/owner settings commands ---
-@bot.hybrid_command(description="Set the channel where all command usage gets logged (server owner only)")
-@discord.app_commands.describe(channel="The channel to send the command usage log to")
-async def setlogchannel(ctx, channel: discord.TextChannel):
-    if ctx.guild is None or ctx.author.id != ctx.guild.owner_id:
-        await ctx.send("🚫 Only the server owner can use this command.")
-        return
+# --- Admin/owner settings (all combined into one command with buttons) ---
+# A ChannelSelect is Discord's native channel-picker dropdown — the person
+# clicks a channel from a list instead of typing "#channel-name" by hand.
+class ChannelPicker(discord.ui.ChannelSelect):
+    def __init__(self, setting_key):
+        # `setting_key` tells the callback below which setting to save —
+        # "counting", "log", or "report" — so one class can handle all three.
+        super().__init__(placeholder="Choose a channel...", channel_types=[discord.ChannelType.text])
+        self.setting_key = setting_key
 
-    settings = load_bot_settings()
-    settings["log_channel_id"] = channel.id
-    if not save_bot_settings(settings):
-        await ctx.send("❌ Database error — the log channel wasn't saved. Check Render logs.")
-        return
-    await ctx.send(f"📝 Command usage will now be logged to {channel.mention}.")
+    async def callback(self, interaction: discord.Interaction):
+        channel = self.values[0]
 
-@bot.hybrid_command(description="Set the channel where the automatic end-of-month report gets posted (server owner only)")
-@discord.app_commands.describe(channel="The channel to send the monthly hosting/strikes report to")
-async def setreportchannel(ctx, channel: discord.TextChannel):
-    if ctx.guild is None or ctx.author.id != ctx.guild.owner_id:
-        await ctx.send("🚫 Only the server owner can use this command.")
-        return
+        if self.setting_key == "counting":
+            count_data = load_count_data()
+            count_data["channel_id"] = channel.id
+            count_data["current_count"] = 0
+            count_data["last_user_id"] = None
+            saved = save_count_data(count_data)
+            result_text = f"🔢 Counting channel set to {channel.mention}. Next number is **1**."
+        elif self.setting_key == "log":
+            settings = load_bot_settings()
+            settings["log_channel_id"] = channel.id
+            saved = save_bot_settings(settings)
+            result_text = f"📝 Command usage will now be logged to {channel.mention}."
+        else:  # "report"
+            settings = load_bot_settings()
+            settings["report_channel_id"] = channel.id
+            saved = save_bot_settings(settings)
+            result_text = f"📅 Monthly reports will now be posted to {channel.mention}."
 
-    settings = load_bot_settings()
-    settings["report_channel_id"] = channel.id
-    if not save_bot_settings(settings):
-        await ctx.send("❌ Database error — the report channel wasn't saved. Check Render logs.")
-        return
-    await ctx.send(f"📅 On the 1st of each month, last month's hosting/strikes report will be posted to {channel.mention}, and that month's hosting numbers will be cleared.")
+        if not saved:
+            await interaction.response.edit_message(content="❌ Database error — the setting wasn't saved.", view=None)
+            return
+        await interaction.response.edit_message(content=result_text, view=None)
 
-@bot.hybrid_command(description="Set the channel used for the counting game")
-@discord.app_commands.describe(channel="The channel to use for counting")
-@commands.has_permissions(administrator=True)
-async def setcountchannel(ctx, channel: discord.TextChannel):
-    count_data = load_count_data()
-    count_data["channel_id"] = channel.id
-    count_data["current_count"] = 0
-    count_data["last_user_id"] = None
-    if not save_count_data(count_data):
-        await ctx.send("❌ Database error — the channel wasn't saved. Check Render logs.")
-        return
-    await ctx.send(f"🔢 Counting channel set to {channel.mention}. Next number is **1**.")
+class ChannelPickerView(discord.ui.View):
+    def __init__(self, setting_key):
+        super().__init__(timeout=60)
+        self.add_item(ChannelPicker(setting_key))
 
-@bot.hybrid_command(description="Turn the counting game on or off")
-@discord.app_commands.describe(state="Turn counting on or off")
-@discord.app_commands.choices(state=[
-    discord.app_commands.Choice(name="on", value="on"),
-    discord.app_commands.Choice(name="off", value="off"),
-])
-@commands.has_permissions(administrator=True)
-async def counting(ctx, state: str):
-    count_data = load_count_data()
+# The main settings menu — one button per configurable setting. Each button
+# checks its own permission when clicked, since a View's buttons don't support
+# the @commands.has_permissions decorator that regular commands use.
+class SettingsView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=120)
 
-    if state.lower() not in ("on", "off"):
-        await ctx.send("❌ Use `!counting on` or `!counting off`.")
-        return
+    @discord.ui.button(label="Counting Channel", style=discord.ButtonStyle.primary, emoji="🔢")
+    async def counting_channel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not interaction.user.guild_permissions.administrator:
+            await interaction.response.send_message("🚫 Requires Administrator.", ephemeral=True)
+            return
+        await interaction.response.send_message("Pick the counting channel:", view=ChannelPickerView("counting"), ephemeral=True)
 
-    count_data["enabled"] = (state.lower() == "on")
-    save_count_data(count_data)
+    @discord.ui.button(label="Toggle Counting", style=discord.ButtonStyle.secondary, emoji="⚙️")
+    async def toggle_counting(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not interaction.user.guild_permissions.administrator:
+            await interaction.response.send_message("🚫 Requires Administrator.", ephemeral=True)
+            return
+        count_data = load_count_data()
+        count_data["enabled"] = not count_data.get("enabled", True)
+        save_count_data(count_data)
+        state = "on" if count_data["enabled"] else "off"
+        await interaction.response.send_message(f"✅ Counting game turned **{state}**.", ephemeral=True)
 
-    if count_data["enabled"]:
-        await ctx.send("✅ Counting game turned **on**.")
-    else:
-        await ctx.send("🛑 Counting game turned **off**. Leaderboard and progress are kept.")
+    @discord.ui.button(label="Command Log Channel", style=discord.ButtonStyle.primary, emoji="📝")
+    async def log_channel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.guild is None or interaction.user.id != interaction.guild.owner_id:
+            await interaction.response.send_message("🚫 Only the server owner can change this.", ephemeral=True)
+            return
+        await interaction.response.send_message("Pick the command log channel:", view=ChannelPickerView("log"), ephemeral=True)
+
+    @discord.ui.button(label="Report Channel", style=discord.ButtonStyle.primary, emoji="📅")
+    async def report_channel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.guild is None or interaction.user.id != interaction.guild.owner_id:
+            await interaction.response.send_message("🚫 Only the server owner can change this.", ephemeral=True)
+            return
+        await interaction.response.send_message("Pick the monthly report channel:", view=ChannelPickerView("report"), ephemeral=True)
+
+    async def on_timeout(self):
+        for item in self.children:
+            item.disabled = True
+
+@bot.hybrid_command(description="Configure E3N's settings (counting channel, log channel, report channel)")
+async def settings(ctx):
+    embed = discord.Embed(
+        title="⚙️ E3N Settings",
+        description="Pick what you'd like to configure below. Each button checks your permission when clicked.",
+        color=discord.Color.blurple()
+    )
+    embed.add_field(name="🔢 Counting Channel / ⚙️ Toggle Counting", value="Requires Administrator", inline=False)
+    embed.add_field(name="📝 Command Log / 📅 Report Channel", value="Requires Server Owner", inline=False)
+    await ctx.send(embed=embed, view=SettingsView())
 
 # --- Leaderboard display + its toggle/reset buttons ---
 def build_leaderboard_embed(count_data, mode="correct"):
@@ -1140,19 +1171,8 @@ async def commands_list(ctx):
         inline=False
     )
     embed.add_field(
-        name="🛡️ Admin Only (requires Administrator)",
-        value=(
-            "`!setcountchannel #channel` — Set the channel used for the counting game\n"
-            "`!counting on/off` — Turn the counting game on or off"
-        ),
-        inline=False
-    )
-    embed.add_field(
-        name="👑 Server Owner Only",
-        value=(
-            "`!setlogchannel #channel` — Set the channel where all command usage gets logged\n"
-            "`!setreportchannel #channel` — Set the channel for the automatic end-of-month report"
-        ),
+        name="🛡️ Admin / Owner Settings",
+        value="`!settings` — Configure counting channel, counting on/off, log channel, and report channel (buttons + channel picker, permission-checked per option)",
         inline=False
     )
     embed.set_footer(text="Works as ! commands or / slash commands")
