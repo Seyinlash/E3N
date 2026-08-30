@@ -30,6 +30,18 @@ app.secret_key = secrets.token_hex(32)
 
 DASHBOARD_PASSWORD = os.getenv("DASHBOARD_PASSWORD")
 
+# Recorded the moment this process starts, so the dashboard can show how long
+# the current deployment has been alive (resets whenever Render restarts it).
+BOT_START_TIME = datetime.utcnow()
+
+def format_uptime(delta: timedelta) -> str:
+    # Turns a timedelta into a friendly "X days, Y hours" string for the dashboard.
+    total_hours = int(delta.total_seconds() // 3600)
+    days, hours = divmod(total_hours, 24)
+    if days:
+        return f"{days}d {hours}h"
+    return f"{hours}h"
+
 @app.route('/')
 def home():
     return "Bot is running."
@@ -93,6 +105,7 @@ DASHBOARD_PAGE = """
       <p>Status: <span class="{{ 'online' if bot_online else 'offline' }}">{{ 'Online' if bot_online else 'Offline' }}</span></p>
       <p>Logged in as: {{ bot_user }}</p>
       <p>Servers: {{ guild_count }}</p>
+      <p>Uptime: {{ uptime_display }}</p>
     </div>
     <div class="card">
       <h2>Counting Game</h2>
@@ -193,6 +206,7 @@ def dashboard():
     bot_online = bot.is_ready()
     bot_user = str(bot.user) if bot.user else "Not connected yet"
     guild_count = len(bot.guilds) if bot.is_ready() else 0
+    uptime_display = format_uptime(datetime.utcnow() - BOT_START_TIME)
 
     members_data = load_data()
     month = get_current_month_key()
@@ -208,6 +222,7 @@ def dashboard():
     return render_template_string(
         DASHBOARD_PAGE,
         bot_online=bot_online, bot_user=bot_user, guild_count=guild_count,
+        uptime_display=uptime_display,
         members_data=members_data, month=month,
         count_data=count_data, leaderboard=leaderboard, ruined_leaderboard=ruined_leaderboard,
         db_stats=db_stats
@@ -307,6 +322,8 @@ def init_db():
         # Added later — safe to run even on an existing table/database
         cur.execute("ALTER TABLE bot_settings ADD COLUMN IF NOT EXISTS report_channel_id BIGINT")
         cur.execute("ALTER TABLE bot_settings ADD COLUMN IF NOT EXISTS last_report_month TEXT")
+        # Added for the AFK toggle command — stores which role gets applied
+        cur.execute("ALTER TABLE bot_settings ADD COLUMN IF NOT EXISTS afk_role_id BIGINT")
         conn.commit()
         cur.close()
         conn.close()
@@ -581,8 +598,8 @@ def parse_count_attempt(content):
 
 # === Bot Settings Storage (bot_settings table) ===
 def load_bot_settings():
-    # Right now this only holds the command-log channel, but it's built to
-    # easily hold more server-wide settings later if you want to add them.
+    # Right now this holds the command-log channel, report channel, and the
+    # AFK role — built to easily hold more server-wide settings later if needed.
     try:
         conn = get_db()
         cur = conn.cursor(cursor_factory=RealDictCursor)
@@ -594,19 +611,20 @@ def load_bot_settings():
             "log_channel_id": row["log_channel_id"] if row else None,
             "report_channel_id": row["report_channel_id"] if row else None,
             "last_report_month": row["last_report_month"] if row else None,
+            "afk_role_id": row["afk_role_id"] if row else None,
         }
     except Exception as e:
         print(f"⚠️ Failed to load bot settings: {e}")
         traceback.print_exc()
-        return {"log_channel_id": None, "report_channel_id": None, "last_report_month": None}
+        return {"log_channel_id": None, "report_channel_id": None, "last_report_month": None, "afk_role_id": None}
 
 def save_bot_settings(settings):
     try:
         conn = get_db()
         cur = conn.cursor()
         cur.execute(
-            "UPDATE bot_settings SET log_channel_id = %s, report_channel_id = %s, last_report_month = %s WHERE id = 1",
-            (settings.get("log_channel_id"), settings.get("report_channel_id"), settings.get("last_report_month"))
+            "UPDATE bot_settings SET log_channel_id = %s, report_channel_id = %s, last_report_month = %s, afk_role_id = %s WHERE id = 1",
+            (settings.get("log_channel_id"), settings.get("report_channel_id"), settings.get("last_report_month"), settings.get("afk_role_id"))
         )
         conn.commit()
         cur.close()
@@ -961,6 +979,30 @@ async def roleinfo(ctx, role: discord.Role):
     embed.add_field(name="Created", value=discord.utils.format_dt(role.created_at, style="R"), inline=True)
     await ctx.send(embed=embed)
 
+# --- AFK toggle (open to everyone, role configured via !settings) ---
+@bot.hybrid_command(description="Toggle the AFK role on/off for yourself")
+async def afk(ctx):
+    settings = load_bot_settings()
+    role_id = settings.get("afk_role_id")
+    if not role_id:
+        await ctx.send("❌ No AFK role has been configured yet. Ask an admin to set one via `!settings`.")
+        return
+
+    role = ctx.guild.get_role(role_id) if ctx.guild else None
+    if not role:
+        await ctx.send("❌ The configured AFK role no longer exists. Ask an admin to set a new one via `!settings`.")
+        return
+
+    try:
+        if role in ctx.author.roles:
+            await ctx.author.remove_roles(role, reason="AFK toggle")
+            await ctx.send(f"👋 Welcome back, {ctx.author.mention}! AFK role removed.")
+        else:
+            await ctx.author.add_roles(role, reason="AFK toggle")
+            await ctx.send(f"💤 {ctx.author.mention} is now AFK.")
+    except discord.Forbidden:
+        await ctx.send("❌ I don't have permission to manage that role — check that my top role is above it.")
+
 # --- Admin/owner settings (all combined into one command with buttons) ---
 # A ChannelSelect is Discord's native channel-picker dropdown — the person
 # clicks a channel from a list instead of typing "#channel-name" by hand.
@@ -1002,6 +1044,31 @@ class ChannelPickerView(discord.ui.View):
         super().__init__(timeout=60)
         self.add_item(ChannelPicker(setting_key))
 
+# Same idea as ChannelPicker above, but Discord's native role-picker dropdown —
+# only used for the AFK role right now, but built the same way in case more
+# role-based settings get added later.
+class RolePicker(discord.ui.RoleSelect):
+    def __init__(self, setting_key):
+        super().__init__(placeholder="Choose a role...")
+        self.setting_key = setting_key
+
+    async def callback(self, interaction: discord.Interaction):
+        role = self.values[0]
+
+        settings = load_bot_settings()
+        settings["afk_role_id"] = role.id
+        saved = save_bot_settings(settings)
+
+        if not saved:
+            await interaction.response.edit_message(content="❌ Database error — the setting wasn't saved.", view=None)
+            return
+        await interaction.response.edit_message(content=f"💤 AFK role set to {role.mention}. `!afk` will now toggle it.", view=None)
+
+class RolePickerView(discord.ui.View):
+    def __init__(self, setting_key):
+        super().__init__(timeout=60)
+        self.add_item(RolePicker(setting_key))
+
 # The main settings menu — one button per configurable setting. Each button
 # checks its own permission when clicked, since a View's buttons don't support
 # the @commands.has_permissions decorator that regular commands use.
@@ -1041,18 +1108,25 @@ class SettingsView(discord.ui.View):
             return
         await interaction.response.send_message("Pick the monthly report channel:", view=ChannelPickerView("report"), ephemeral=True)
 
+    @discord.ui.button(label="AFK Role", style=discord.ButtonStyle.secondary, emoji="💤")
+    async def afk_role(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not interaction.user.guild_permissions.administrator:
+            await interaction.response.send_message("🚫 Requires Administrator.", ephemeral=True)
+            return
+        await interaction.response.send_message("Pick the role `!afk` should toggle:", view=RolePickerView("afk"), ephemeral=True)
+
     async def on_timeout(self):
         for item in self.children:
             item.disabled = True
 
-@bot.hybrid_command(description="Configure E3N's settings (counting channel, log channel, report channel)")
+@bot.hybrid_command(description="Configure E3N's settings (counting channel, log channel, report channel, AFK role)")
 async def settings(ctx):
     embed = discord.Embed(
         title="⚙️ E3N Settings",
         description="Pick what you'd like to configure below. Each button checks your permission when clicked.",
         color=discord.Color.blurple()
     )
-    embed.add_field(name="🔢 Counting Channel / ⚙️ Toggle Counting", value="Requires Administrator", inline=False)
+    embed.add_field(name="🔢 Counting Channel / ⚙️ Toggle Counting / 💤 AFK Role", value="Requires Administrator", inline=False)
     embed.add_field(name="📝 Command Log / 📅 Report Channel", value="Requires Server Owner", inline=False)
     await ctx.send(embed=embed, view=SettingsView())
 
@@ -1155,6 +1229,7 @@ async def commands_list(ctx):
             "`!ruinedboard` — Show who's broken the count the most\n"
             "`!userinfo [@member]` — Show info about a member (defaults to you)\n"
             "`!roleinfo @role` — Show info about a role\n"
+            "`!afk` — Toggle the AFK role on/off for yourself\n"
             "`!commands` — Show this message"
         ),
         inline=False
@@ -1172,7 +1247,7 @@ async def commands_list(ctx):
     )
     embed.add_field(
         name="🛡️ Admin / Owner Settings",
-        value="`!settings` — Configure counting channel, counting on/off, log channel, and report channel (buttons + channel picker, permission-checked per option)",
+        value="`!settings` — Configure counting channel, counting on/off, log channel, report channel, and AFK role (buttons + channel/role picker, permission-checked per option)",
         inline=False
     )
     embed.set_footer(text="Works as ! commands or / slash commands")
