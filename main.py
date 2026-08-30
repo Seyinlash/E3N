@@ -1,7 +1,7 @@
 from flask import Flask, request, session, redirect, url_for, render_template_string
 from threading import Thread
 import discord
-from discord.ext import commands
+from discord.ext import commands, tasks
 import os
 import json
 import sys
@@ -101,6 +101,17 @@ DASHBOARD_PAGE = """
       <p>Enabled: {{ 'Yes' if count_data.enabled else 'No' }}</p>
       <p>All-time record: {{ count_data.best_streak }}{% if count_data.best_streak_holder %} (by {{ count_data.best_streak_holder }}){% endif %}</p>
     </div>
+    <div class="card">
+      <h2>Database (Supabase)</h2>
+      {% if db_stats.error %}
+      <p style="color:#f23f42;">⚠️ {{ db_stats.error }}</p>
+      {% else %}
+      <p>Database size: <strong>{{ db_stats.db_size }}</strong></p>
+      <p>Active connections: <strong>{{ db_stats.active_connections }}</strong></p>
+      <p>Total rows tracked: <strong>{{ db_stats.total_rows }}</strong></p>
+      <p style="color:#949ba4; font-size:12px;">{{ db_stats.pg_version }}</p>
+      {% endif %}
+    </div>
   </div>
 
   <div class="grid">
@@ -192,12 +203,14 @@ def dashboard():
         (u for u in all_users if u["times_ruined"] > 0),
         key=lambda u: u["times_ruined"], reverse=True
     )[:10]
+    db_stats = get_db_stats()
 
     return render_template_string(
         DASHBOARD_PAGE,
         bot_online=bot_online, bot_user=bot_user, guild_count=guild_count,
         members_data=members_data, month=month,
-        count_data=count_data, leaderboard=leaderboard, ruined_leaderboard=ruined_leaderboard
+        count_data=count_data, leaderboard=leaderboard, ruined_leaderboard=ruined_leaderboard,
+        db_stats=db_stats
     )
 
 def run():
@@ -291,6 +304,9 @@ def init_db():
             )
         """)
         cur.execute("INSERT INTO bot_settings (id) VALUES (1) ON CONFLICT (id) DO NOTHING")
+        # Added later — safe to run even on an existing table/database
+        cur.execute("ALTER TABLE bot_settings ADD COLUMN IF NOT EXISTS report_channel_id BIGINT")
+        cur.execute("ALTER TABLE bot_settings ADD COLUMN IF NOT EXISTS last_report_month TEXT")
         conn.commit()
         cur.close()
         conn.close()
@@ -298,6 +314,40 @@ def init_db():
     except Exception as e:
         print(f"⚠️ Failed to initialize database: {e}")
         traceback.print_exc()
+
+def get_db_stats():
+    # Pulls a few read-only stats straight from Postgres itself (not our own
+    # tables) — this works because Supabase is just managed Postgres under
+    # the hood, so any standard Postgres system view works here too.
+    try:
+        conn = get_db()
+        cur = conn.cursor()
+
+        cur.execute("SELECT pg_size_pretty(pg_database_size(current_database()))")
+        db_size = cur.fetchone()[0]
+
+        cur.execute("SELECT count(*) FROM pg_stat_activity WHERE datname = current_database()")
+        active_connections = cur.fetchone()[0]
+
+        cur.execute("SELECT version()")
+        pg_version = cur.fetchone()[0].split(",")[0]
+
+        total_rows = 0
+        for table in ("members", "counting_users", "counting_config", "bot_settings"):
+            cur.execute(f"SELECT count(*) FROM {table}")
+            total_rows += cur.fetchone()[0]
+
+        cur.close()
+        conn.close()
+        return {
+            "db_size": db_size,
+            "active_connections": active_connections,
+            "pg_version": pg_version,
+            "total_rows": total_rows,
+        }
+    except Exception as e:
+        print(f"⚠️ Failed to load database stats: {e}")
+        return {"error": str(e)}
 
 # === Strikes/Hosting Storage (members table) ===
 def load_data():
@@ -348,6 +398,13 @@ def get_current_month_key():
     now = datetime.utcnow()
     return now.strftime("%Y-%m")
 
+def get_previous_month_key():
+    # First day of this month, minus one day, lands in the previous month —
+    # a reliable way to get "last month" regardless of how many days it had.
+    first_of_this_month = datetime.utcnow().replace(day=1)
+    last_day_prev_month = first_of_this_month - timedelta(days=1)
+    return last_day_prev_month.strftime("%Y-%m")
+
 def ensure_member(data, member: discord.Member):
     # Makes sure this Discord member has a record in `data` before we try to
     # edit their strikes/hosting numbers — creates one if it's their first time.
@@ -366,6 +423,32 @@ def ensure_member(data, member: discord.Member):
         data[uid]["monthly"][month] = 0
 
     return uid, month
+
+def build_month_report_embed(data, month_key, title_prefix="🧾"):
+    # Builds the hosting+strikes report embed for one specific month — shared
+    # by the manual !exportmonth command and the automatic end-of-month job.
+    host_lines = []
+    strike_lines = []
+    for record in sorted(data.values(), key=lambda x: x.get("display_name", "")):
+        name = record["display_name"]
+        hosted = record.get("monthly", {}).get(month_key, 0)
+        strikes = record.get("strikes", 0)
+        if hosted or strikes:
+            host_lines.append(f"{name}: {hosted}")
+            strike_lines.append(f"{name}: {strikes}")
+
+    try:
+        month_display = datetime.strptime(month_key, "%Y-%m").strftime("%B %Y")
+    except ValueError:
+        month_display = month_key
+
+    embed = discord.Embed(
+        title=f"{title_prefix} {month_display} Report",
+        color=discord.Color.blurple()
+    )
+    embed.add_field(name="Hosting", value="\n".join(host_lines) or "No hosting logged.", inline=True)
+    embed.add_field(name="Strikes (current totals)", value="\n".join(strike_lines) or "No strikes.", inline=True)
+    return embed
 
 # === Counting Game Storage (counting_config + counting_users tables) ===
 def load_count_data():
@@ -507,19 +590,23 @@ def load_bot_settings():
         row = cur.fetchone()
         cur.close()
         conn.close()
-        return {"log_channel_id": row["log_channel_id"] if row else None}
+        return {
+            "log_channel_id": row["log_channel_id"] if row else None,
+            "report_channel_id": row["report_channel_id"] if row else None,
+            "last_report_month": row["last_report_month"] if row else None,
+        }
     except Exception as e:
         print(f"⚠️ Failed to load bot settings: {e}")
         traceback.print_exc()
-        return {"log_channel_id": None}
+        return {"log_channel_id": None, "report_channel_id": None, "last_report_month": None}
 
 def save_bot_settings(settings):
     try:
         conn = get_db()
         cur = conn.cursor()
         cur.execute(
-            "UPDATE bot_settings SET log_channel_id = %s WHERE id = 1",
-            (settings.get("log_channel_id"),)
+            "UPDATE bot_settings SET log_channel_id = %s, report_channel_id = %s, last_report_month = %s WHERE id = 1",
+            (settings.get("log_channel_id"), settings.get("report_channel_id"), settings.get("last_report_month"))
         )
         conn.commit()
         cur.close()
@@ -571,6 +658,56 @@ async def on_ready():
         await bot.tree.sync()
     except Exception as e:
         print(f"Slash command sync failed: {e}")
+
+    # Only start the daily check once — on_ready can fire again on reconnect
+    if not check_monthly_report.is_running():
+        check_monthly_report.start()
+
+@tasks.loop(hours=24)
+async def check_monthly_report():
+    # Runs once a day. If today is the 1st of the month (and we haven't
+    # already reported this rollover), post last month's hosting/strikes
+    # report to the configured channel, then clear that month's hosting numbers.
+    today = datetime.utcnow()
+    if today.day != 1:
+        return
+
+    settings = load_bot_settings()
+    prev_month = get_previous_month_key()
+
+    if settings.get("last_report_month") == prev_month:
+        return  # Already handled this month's rollover
+
+    channel_id = settings.get("report_channel_id")
+    if not channel_id:
+        return  # No report channel configured — skip silently
+
+    channel = bot.get_channel(channel_id)
+    if not channel:
+        return
+
+    data = load_data()
+    embed = build_month_report_embed(data, prev_month, title_prefix="📅")
+    embed.set_footer(text="This month's hosting numbers have been cleared. Strikes are unaffected.")
+
+    try:
+        await channel.send(embed=embed)
+    except discord.HTTPException as e:
+        print(f"⚠️ Failed to send monthly report: {e}")
+        return
+
+    # Clear only the completed month's hosting numbers — strikes and other
+    # months are left untouched
+    for rec in data.values():
+        rec.get("monthly", {}).pop(prev_month, None)
+    save_data(data)
+
+    settings["last_report_month"] = prev_month
+    save_bot_settings(settings)
+
+@check_monthly_report.before_loop
+async def before_monthly_report():
+    await bot.wait_until_ready()
 
 @bot.after_invoke
 async def log_command_usage(ctx):
@@ -767,6 +904,21 @@ async def logs(ctx):
                    f"**Hosting:**\n" + "\n".join(host_lines) +
                    f"\n\n**Strikes:**\n" + "\n".join(strike_lines))
 
+@bot.hybrid_command(description="Export a specific month's hosting + strike report (defaults to current month)")
+@discord.app_commands.describe(month="Month in YYYY-MM format, e.g. 2026-07 (defaults to the current month)")
+@commands.has_permissions(manage_messages=True)
+async def exportmonth(ctx, month: str = None):
+    month_key = month or get_current_month_key()
+    try:
+        datetime.strptime(month_key, "%Y-%m")
+    except ValueError:
+        await ctx.send("❌ Use the format `YYYY-MM`, e.g. `2026-07`.")
+        return
+
+    data = load_data()
+    embed = build_month_report_embed(data, month_key)
+    await ctx.send(embed=embed)
+
 # --- Info-lookup commands (open to everyone) ---
 @bot.hybrid_command(description="Show info about a server member")
 @discord.app_commands.describe(member="The member to look up (defaults to you)")
@@ -774,7 +926,7 @@ async def userinfo(ctx, member: discord.Member = None):
     member = member or ctx.author
 
     roles = [r.mention for r in member.roles if r.name != "@everyone"]
-    roles.reverse()  # highest role first
+    roles.reverse()
     roles_display = ", ".join(roles) if roles else "None"
     if len(roles_display) > 1000:
         roles_display = f"{len(roles)} roles (too many to list)"
@@ -823,6 +975,20 @@ async def setlogchannel(ctx, channel: discord.TextChannel):
         await ctx.send("❌ Database error — the log channel wasn't saved. Check Render logs.")
         return
     await ctx.send(f"📝 Command usage will now be logged to {channel.mention}.")
+
+@bot.hybrid_command(description="Set the channel where the automatic end-of-month report gets posted (server owner only)")
+@discord.app_commands.describe(channel="The channel to send the monthly hosting/strikes report to")
+async def setreportchannel(ctx, channel: discord.TextChannel):
+    if ctx.guild is None or ctx.author.id != ctx.guild.owner_id:
+        await ctx.send("🚫 Only the server owner can use this command.")
+        return
+
+    settings = load_bot_settings()
+    settings["report_channel_id"] = channel.id
+    if not save_bot_settings(settings):
+        await ctx.send("❌ Database error — the report channel wasn't saved. Check Render logs.")
+        return
+    await ctx.send(f"📅 On the 1st of each month, last month's hosting/strikes report will be posted to {channel.mention}, and that month's hosting numbers will be cleared.")
 
 @bot.hybrid_command(description="Set the channel used for the counting game")
 @discord.app_commands.describe(channel="The channel to use for counting")
@@ -937,6 +1103,11 @@ async def countboard(ctx):
     count_data = load_count_data()
     await ctx.send(embed=build_leaderboard_embed(count_data, "correct"), view=LeaderboardView())
 
+@bot.hybrid_command(description="Show who's broken the count the most")
+async def ruinedboard(ctx):
+    count_data = load_count_data()
+    await ctx.send(embed=build_leaderboard_embed(count_data, "ruined"), view=LeaderboardView())
+
 @bot.hybrid_command(name="commands", description="Show everything E3N can do")
 async def commands_list(ctx):
     embed = discord.Embed(
@@ -950,6 +1121,7 @@ async def commands_list(ctx):
             "`!strikes` — Show everyone's strike totals\n"
             "`!logs` — Show this month's hosting + strike totals\n"
             "`!countboard` — Show the counting leaderboard (toggle Correct/Ruined)\n"
+            "`!ruinedboard` — Show who's broken the count the most\n"
             "`!userinfo [@member]` — Show info about a member (defaults to you)\n"
             "`!roleinfo @role` — Show info about a role\n"
             "`!commands` — Show this message"
@@ -962,7 +1134,8 @@ async def commands_list(ctx):
             "`!loghost @member [count]` — Log hosted event(s) for a member (default 1)\n"
             "`!deletehost @member [count]` — Remove hosted-event log(s) for a member (default 1)\n"
             "`!strike @member [count]` — Add strike(s) to a member (default 1)\n"
-            "`!resetstrikes @member` — Reset a member's strikes to 0"
+            "`!resetstrikes @member` — Reset a member's strikes to 0\n"
+            "`!exportmonth [YYYY-MM]` — Export a month's hosting + strike report (defaults to current month)"
         ),
         inline=False
     )
@@ -976,7 +1149,10 @@ async def commands_list(ctx):
     )
     embed.add_field(
         name="👑 Server Owner Only",
-        value="`!setlogchannel #channel` — Set the channel where all command usage gets logged",
+        value=(
+            "`!setlogchannel #channel` — Set the channel where all command usage gets logged\n"
+            "`!setreportchannel #channel` — Set the channel for the automatic end-of-month report"
+        ),
         inline=False
     )
     embed.set_footer(text="Works as ! commands or / slash commands")
