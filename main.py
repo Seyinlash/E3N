@@ -650,8 +650,17 @@ def ensure_count_user(data, member: discord.Member):
     return uid
 
 # === Events ===
+# on_ready can fire more than once per process (Discord re-fires it on every
+# reconnect, not just the first connect). This flag makes sure the slash
+# command sync below only ever runs ONCE per process — repeating the full
+# per-guild + global sync on every reconnect is what previously hammered
+# Discord's API and got the bot rate-limited (Cloudflare error 1015 / HTTP 429).
+_slash_synced = False
+
 @bot.event
 async def on_ready():
+    global _slash_synced
+
     # Fires once the bot has fully connected to Discord. This is also where
     # we register all the slash ("/") commands so they show up in Discord's UI.
     print(f"Bot online as {bot.user}")
@@ -662,20 +671,24 @@ async def on_ready():
     site_url = os.getenv("RENDER_EXTERNAL_URL", "https://e3n.onrender.com")
     print(f"📊 Dashboard: {site_url}/dashboard")
 
-    try:
-        # Guild sync FIRST (instant) — copies the currently-registered commands
-        # into every server the bot is in, while they're still in the tree
-        for guild in bot.guilds:
-            bot.tree.copy_global_to(guild=guild)
-            synced = await bot.tree.sync(guild=guild)
-            print(f"Synced {len(synced)} slash command(s) to {guild.name}")
+    if not _slash_synced:
+        try:
+            # Guild sync FIRST (instant) — copies the currently-registered commands
+            # into every server the bot is in, while they're still in the tree
+            for guild in bot.guilds:
+                bot.tree.copy_global_to(guild=guild)
+                synced = await bot.tree.sync(guild=guild)
+                print(f"Synced {len(synced)} slash command(s) to {guild.name}")
 
-        # THEN clear + sync the global scope so Discord doesn't also show a
-        # separate global copy of every command (which caused duplicates)
-        bot.tree.clear_commands(guild=None)
-        await bot.tree.sync()
-    except Exception as e:
-        print(f"Slash command sync failed: {e}")
+            # THEN clear + sync the global scope so Discord doesn't also show a
+            # separate global copy of every command (which caused duplicates)
+            bot.tree.clear_commands(guild=None)
+            await bot.tree.sync()
+            _slash_synced = True
+        except Exception as e:
+            print(f"Slash command sync failed: {e}")
+    else:
+        print("Slash commands already synced this session — skipping re-sync on reconnect.")
 
     # Only start the daily check once — on_ready can fire again on reconnect
     if not check_monthly_report.is_running():
